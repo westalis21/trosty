@@ -21,6 +21,7 @@ fn session_masks_secret_on_screen() {
     cmd.env("TROSTY_DATA_DIR", dir.path());
     cmd.env("TROSTY_MEMORY_STORE", "1");
     cmd.env("TROSTY_SEED", "proj/key=supersecret9");
+    cmd.env("TROSTY_NO_STATUS", "1");
     // inner "shell": prints the secret and exits
     cmd.env("TROSTY_SHELL", "/bin/sh");
     cmd.env("TROSTY_SHELL_ARGS", "-c,echo start supersecret9 end");
@@ -65,6 +66,7 @@ fn session_refuses_to_run_when_indexed_secret_unreadable() {
     let mut cmd = CommandBuilder::new(cargo_bin("trosty"));
     cmd.env("TROSTY_CONFIG_DIR", dir.path());
     cmd.env("TROSTY_DATA_DIR", dir.path());
+    cmd.env("TROSTY_NO_STATUS", "1");
     // Deliberately no TROSTY_MEMORY_STORE / TROSTY_SEED: the real keychain
     // has no entry for this name, so the index reference is genuinely
     // unreadable and collect_secrets must refuse.
@@ -86,5 +88,39 @@ fn session_refuses_to_run_when_indexed_secret_unreadable() {
     assert!(
         !out.contains("INNER_SHELL_MARKER_SHOULD_NEVER_APPEAR"),
         "inner shell must never spawn — fail-closed check must happen before session::run: {out}"
+    );
+}
+
+/// Status bar is drawn with scroll region, showing project and secret count,
+/// and properly cleaned up on exit.
+#[test]
+fn session_draws_status_bar_with_project_and_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut cmd = CommandBuilder::new(cargo_bin("trosty"));
+    cmd.env("TROSTY_CONFIG_DIR", dir.path());
+    cmd.env("TROSTY_DATA_DIR", dir.path());
+    cmd.env("TROSTY_MEMORY_STORE", "1");
+    cmd.env("TROSTY_SEED", "proj/key=supersecret9");
+    cmd.env("TROSTY_SHELL", "/bin/sh");
+    cmd.env("TROSTY_SHELL_ARGS", "-c,echo hello");
+    let mut child = pty.slave.spawn_command(cmd).unwrap();
+    drop(pty.slave);
+    let mut out = String::new();
+    let mut reader = pty.master.try_clone_reader().unwrap();
+    reader.read_to_string(&mut out).ok();
+    child.wait().unwrap();
+    assert!(out.contains("\x1b[1;23r"), "scroll region not set: {out:?}");
+    assert!(out.contains("1 secrets"), "bar text missing: {out:?}");
+    assert!(
+        out.contains("\x1b[r"),
+        "scroll region not reset on exit: {out:?}"
     );
 }

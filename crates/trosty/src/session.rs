@@ -12,6 +12,121 @@ enum SessionEvent {
     Peek,
 }
 
+struct StatusBar {
+    rows: u16,
+    cols: u16,
+    enabled: bool,
+    alt_screen: bool,
+}
+
+impl StatusBar {
+    fn new(rows: u16, cols: u16, enabled: bool) -> Self {
+        StatusBar {
+            rows,
+            cols,
+            enabled,
+            alt_screen: false,
+        }
+    }
+
+    fn init(&self, out: &mut dyn Write) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        // Set scroll region to rows 1..{rows-1}, leaving row {rows} for the bar
+        let region_cmd = format!("\x1b[1;{}r", self.rows - 1);
+        out.write_all(region_cmd.as_bytes())?;
+        // Move cursor to row 1, col 1
+        out.write_all(b"\x1b[1;1H")?;
+        out.flush()?;
+        Ok(())
+    }
+
+    fn draw(
+        &mut self,
+        out: &mut dyn Write,
+        project: Option<&str>,
+        secret_count: usize,
+    ) -> Result<()> {
+        if !self.enabled || self.alt_screen {
+            return Ok(());
+        }
+
+        let lock = "🔒";
+        let project_name = project.unwrap_or("(none)");
+        let text = format!(
+            "{} trosty · {} · {} secrets",
+            lock, project_name, secret_count
+        );
+
+        // Truncate text by characters (not bytes) to fit in the available cols
+        let max_chars = (self.cols as usize).saturating_sub(1);
+        let truncated = text.chars().take(max_chars).collect::<String>();
+
+        // Save cursor, move to last row, clear line, write text, restore cursor
+        out.write_all(b"\x1b7")?; // Save cursor
+        let move_cmd = format!("\x1b[{};1H", self.rows); // Move to last row, col 1
+        out.write_all(move_cmd.as_bytes())?;
+        out.write_all(b"\x1b[2K")?; // Clear line
+        out.write_all(truncated.as_bytes())?;
+        out.write_all(b"\x1b8")?; // Restore cursor
+        out.flush()?;
+        Ok(())
+    }
+
+    fn teardown(&self, out: &mut dyn Write) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        // Reset scroll region
+        out.write_all(b"\x1b[r")?;
+        // Move to last row and clear it
+        let move_cmd = format!("\x1b[{};1H", self.rows);
+        out.write_all(move_cmd.as_bytes())?;
+        out.write_all(b"\x1b[2K")?;
+        out.flush()?;
+        Ok(())
+    }
+
+    fn on_resize(
+        &mut self,
+        rows: u16,
+        cols: u16,
+        out: &mut dyn Write,
+        project: Option<&str>,
+        secret_count: usize,
+    ) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        self.rows = rows;
+        self.cols = cols;
+        // Re-init scroll region with new dimensions
+        let region_cmd = format!("\x1b[1;{}r", self.rows - 1);
+        out.write_all(region_cmd.as_bytes())?;
+        // Redraw the bar
+        self.draw(out, project, secret_count)?;
+        Ok(())
+    }
+
+    fn scan_for_alt_screen(&mut self, chunk: &[u8]) {
+        // Check for alt-screen enter sequences
+        if chunk.windows(8).any(|w| w == b"\x1b[?1049h")
+            || chunk.windows(8).any(|w| w == b"\x1b[?47h\x1b")
+            || chunk.windows(9).any(|w| w == b"\x1b[?1047h")
+        {
+            self.alt_screen = true;
+        }
+        // Check for alt-screen exit sequences (same but with 'l' instead of 'h')
+        if chunk.windows(8).any(|w| w == b"\x1b[?1049l")
+            || chunk.windows(8).any(|w| w == b"\x1b[?47l\x1b")
+            || chunk.windows(9).any(|w| w == b"\x1b[?1047l")
+        {
+            self.alt_screen = false;
+        }
+    }
+}
+
 fn shell_command() -> CommandBuilder {
     let shell = std::env::var("TROSTY_SHELL")
         .ok()
@@ -120,6 +235,12 @@ pub fn run(
     let _ = stdout.write_all(banner.as_bytes());
     let _ = stdout.flush();
 
+    // Initialize status bar (disabled if TROSTY_NO_STATUS=1)
+    let status_enabled = std::env::var("TROSTY_NO_STATUS").is_err();
+    let size = term_size();
+    let mut bar = StatusBar::new(size.rows, size.cols, status_enabled);
+    let _ = bar.init(&mut stdout);
+
     // Raw mode only when stdin is a real TTY (tests drive us inside a PTY,
     // which IS a tty; a plain pipe is not — then skip raw mode). The guard
     // restores it on every exit path, including early returns below.
@@ -207,15 +328,27 @@ pub fn run(
     loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(SessionEvent::Output(chunk)) => {
+                // Scan for alt-screen sequences before masking
+                bar.scan_for_alt_screen(&chunk);
                 let masked = stream.feed_bytes(&chunk);
                 if stdout.write_all(&masked).is_err() {
                     break;
                 }
                 let _ = stdout.flush();
+                // Redraw status bar after output (no-op if alt_screen is true)
+                let _ = bar.draw(&mut stdout, project.as_deref(), secrets.len());
             }
             Ok(SessionEvent::Eof) => break,
             Ok(SessionEvent::Resize) => {
-                let _ = pty.master.resize(term_size());
+                let size = term_size();
+                let _ = pty.master.resize(size);
+                let _ = bar.on_resize(
+                    size.rows,
+                    size.cols,
+                    &mut stdout,
+                    project.as_deref(),
+                    secrets.len(),
+                );
             }
             Ok(SessionEvent::Peek) => {
                 // handled in Plan 2b Task 4
@@ -241,6 +374,7 @@ pub fn run(
     drop(rx);
     let _ = stdout.write_all(&stream.finish_bytes());
     let _ = stdout.flush();
+    let _ = bar.teardown(&mut stdout);
 
     // Explicit disable on the happy path (in addition to the guard) so the
     // terminal is restored before the shell's exit status is observed, not
