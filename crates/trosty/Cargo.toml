@@ -1,0 +1,11 @@
+[package]
+name = "trosty"
+description = "A protective terminal layer for working with secrets next to AI tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+trosty-core = { path = "../core" }
