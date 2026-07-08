@@ -69,6 +69,12 @@ fn exec_expands_and_masks() {
     // echo received the real value, but trosty masked it back on the way out
     assert!(out.contains("value is {{proj/key}}"));
     assert!(!out.contains("supersecret9"));
+    // Audit must record placeholder names only — never the raw arg (which
+    // may embed literal secret values) and never the value itself.
+    let audit = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+    assert!(audit.contains("\"name\":\"proj/key\""));
+    assert!(!audit.contains("supersecret9"));
+    assert!(!audit.contains("value is"));
 }
 
 #[test]

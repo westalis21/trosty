@@ -65,6 +65,25 @@ fn data_dir() -> PathBuf {
         .unwrap_or_else(|| dirs::data_dir().expect("data dir").join("trosty"))
 }
 
+/// Extract valid `{{name}}` placeholder names from a string.
+fn placeholder_names(text: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find("{{") {
+        let after = &rest[open + 2..];
+        match after.find("}}") {
+            Some(close) => {
+                if let Ok(name) = SecretName::from_str(&after[..close]) {
+                    names.push(name.to_string());
+                }
+                rest = &after[close + 2..];
+            }
+            None => break,
+        }
+    }
+    names
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let Some(cmd) = cli.command else {
@@ -156,7 +175,11 @@ fn main() -> Result<()> {
             for arg in &cmd {
                 let e = trosty_core::expand(arg, store.as_ref())?;
                 if e != *arg {
-                    audit.log("expanded", arg);
+                    // Audit names only — the raw arg may embed literal
+                    // secret values, which must never reach the log.
+                    for name in placeholder_names(arg) {
+                        audit.log("expanded", &name);
+                    }
                 }
                 expanded.push(e);
             }
