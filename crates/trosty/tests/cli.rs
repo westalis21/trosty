@@ -124,6 +124,7 @@ fn exec_unknown_placeholder_runs_nothing() {
 }
 
 #[test]
+#[cfg(unix)]
 fn exec_masks_secret_inside_binaryish_output() {
     let dir = tempfile::tempdir().unwrap();
     let mut cmd = Command::cargo_bin("trosty").unwrap();
@@ -137,7 +138,11 @@ fn exec_masks_secret_inside_binaryish_output() {
             "--",
             "sh",
             "-c",
-            "printf 'п\\xffsupersecret9\\xffк'",
+            // \377 is the POSIX octal escape for byte 0xFF — portable across
+            // dash and bash. `\xff` is a bash/coreutils-only hex escape and
+            // dash (Ubuntu's default /bin/sh) prints it literally instead of
+            // emitting the byte, which broke this test under CI's `sh`.
+            "printf 'п\\377supersecret9\\377к'",
         ])
         .assert()
         .success();

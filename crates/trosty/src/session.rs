@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{native_pty_system, Child, CommandBuilder, PtySize};
 use std::io::{Read, Write};
 use std::sync::mpsc;
 use trosty_core::{Audit, ProjectsFile, Scrubber, SecretName};
@@ -16,6 +16,10 @@ fn shell_command() -> CommandBuilder {
             }
         });
     let mut cmd = CommandBuilder::new(shell);
+    // Test-only override (like TROSTY_SEED in main.rs): lets tests script a
+    // fake inner "shell" without spawning a real one. Comma-splitting means
+    // an argument that itself needs a literal comma is inexpressible by
+    // design — acceptable since this knob never runs in production.
     if let Ok(args) = std::env::var("TROSTY_SHELL_ARGS") {
         for a in args.split(',') {
             cmd.arg(a);
@@ -50,6 +54,29 @@ impl Drop for RawModeGuard {
     }
 }
 
+/// Kills (and reaps) the child shell if dropped before `into_inner` hands
+/// it off for the normal, final `wait()`. Several `?`-fallible calls run
+/// between spawning the shell and that final wait (`take_writer`,
+/// `try_clone_reader`, `Signals::new`); without this guard, an early return
+/// through any of them would drop `child` and leak an orphaned shell
+/// process instead of terminating it.
+struct ChildGuard(Option<Box<dyn Child + Send + Sync>>);
+
+impl ChildGuard {
+    fn into_inner(mut self) -> Box<dyn Child + Send + Sync> {
+        self.0.take().expect("child present until into_inner")
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 /// Run an interactive shell session inside a PTY, masking known secrets on
 /// the way to the screen. `collect_secrets` (main.rs) is called by the
 /// caller before this runs — this function receives the already-collected
@@ -68,10 +95,11 @@ pub fn run(
     let pty = native_pty_system()
         .openpty(term_size())
         .context("open pty")?;
-    let mut child = pty
+    let child = pty
         .slave
         .spawn_command(shell_command())
         .context("spawn shell in pty")?;
+    let child_guard = ChildGuard(Some(child));
     drop(pty.slave);
 
     audit.log("session_start", project.as_deref().unwrap_or("-"));
@@ -172,6 +200,13 @@ pub fn run(
             let _ = pty.master.resize(term_size());
         }
     }
+    // Drop the receiver now, before waiting on the shell: this makes every
+    // subsequent send from the reader (and SIGWINCH) threads fail and exit
+    // promptly. Without it, if the loop above `break`s early (screen write
+    // failed) while the shell keeps producing output, those threads would
+    // keep sending into an unbounded channel nobody drains, growing memory
+    // without limit until the shell eventually exits on its own.
+    drop(rx);
     let _ = stdout.write_all(&stream.finish_bytes());
     let _ = stdout.flush();
 
@@ -181,7 +216,7 @@ pub fn run(
     if raw {
         let _ = crossterm::terminal::disable_raw_mode();
     }
-    let status = child.wait().context("wait for shell")?;
+    let status = child_guard.into_inner().wait().context("wait for shell")?;
     audit.log("session_end", project.as_deref().unwrap_or("-"));
     Ok(status.exit_code() as i32)
 }

@@ -8,6 +8,10 @@ pub struct Scrubber {
     ac: Option<AhoCorasick>,
     replacements: Vec<String>,
     max_len: usize,
+    /// Byte form of every pattern (raw value + all encoded variants), kept
+    /// around so `StreamScrubber` can check whether a trailing carry suffix
+    /// is a strict prefix of some pattern (see `feed_bytes`).
+    patterns: Vec<Vec<u8>>,
 }
 
 fn variants(value: &str) -> Vec<String> {
@@ -38,6 +42,7 @@ impl Scrubber {
             }
         }
         let max_len = patterns.iter().map(String::len).max().unwrap_or(0);
+        let byte_patterns = patterns.iter().map(|p| p.as_bytes().to_vec()).collect();
         let ac = if patterns.is_empty() {
             None
         } else {
@@ -52,6 +57,7 @@ impl Scrubber {
             ac,
             replacements,
             max_len,
+            patterns: byte_patterns,
         }
     }
 
@@ -97,10 +103,31 @@ pub struct StreamScrubber<'a> {
 impl StreamScrubber<'_> {
     pub fn feed_bytes(&mut self, chunk: &[u8]) -> Vec<u8> {
         self.carry.extend_from_slice(chunk);
-        let hold = self.scrubber.max_pattern_len().saturating_sub(1);
-        if self.carry.len() <= hold {
-            return Vec::new();
+
+        // Hold back only the longest suffix of the carry that could still
+        // grow into a pattern — i.e. that is a STRICT prefix of some
+        // pattern (a full-length match would already have been found by
+        // find_iter below, so only a shorter, still-extendable prefix
+        // matters here). Everything else is safe to flush now: it cannot
+        // ever become part of a masked match no matter what bytes arrive
+        // next. This is what keeps an interactive prompt from lagging by
+        // (max_pattern_len - 1) bytes with nothing held.
+        let cap = self.scrubber.max_pattern_len().saturating_sub(1);
+        let limit = cap.min(self.carry.len());
+        let mut hold = 0usize;
+        for k in (1..=limit).rev() {
+            let suffix = &self.carry[self.carry.len() - k..];
+            if self
+                .scrubber
+                .patterns
+                .iter()
+                .any(|p| p.len() > k && p.starts_with(suffix))
+            {
+                hold = k;
+                break;
+            }
         }
+
         let mut cut = self.carry.len() - hold;
         if let Some(ac) = &self.scrubber.ac {
             for m in ac.find_iter(&self.carry) {
@@ -119,8 +146,10 @@ impl StreamScrubber<'_> {
     }
 
     /// Feed a chunk; returns masked text that is safe to emit now.
-    /// Holds back up to (max_pattern_len - 1) trailing bytes in case a
-    /// secret is split across chunk boundaries.
+    /// Holds back only the trailing bytes that are themselves a strict
+    /// prefix of some pattern (up to max_pattern_len - 1 of them) in case a
+    /// secret is split across chunk boundaries — everything else (e.g. a
+    /// shell prompt) is flushed immediately, with no idle-timeout needed.
     pub fn feed(&mut self, chunk: &str) -> String {
         String::from_utf8_lossy(&self.feed_bytes(chunk.as_bytes())).into_owned()
     }
@@ -218,6 +247,30 @@ mod tests {
         let out = s.scrub_bytes(&data);
         let expected: Vec<u8> = [&[0xFF, 0xFE][..], b"{{proj/key}}", &[0xFF][..]].concat();
         assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn stream_prompt_flushes_immediately_no_held_tail() {
+        // Regression test for interactive latency: a shell prompt has no
+        // suffix that is a prefix of any variant of "s3cretVALUE", so it
+        // must come through in full on the first feed — no lag waiting for
+        // more bytes that may never come in a live session.
+        let s = scr();
+        let mut st = s.stream();
+        assert_eq!(st.feed_bytes(b"PROMPT> "), b"PROMPT> ".to_vec());
+    }
+
+    #[test]
+    fn stream_holds_only_the_prefix_suffix_not_the_whole_tail() {
+        // "xs" ends in "s", which IS a strict prefix of "s3cretVALUE", so
+        // only that one byte must be held back — "x" must flush now.
+        let s = scr();
+        let mut st = s.stream();
+        assert_eq!(st.feed_bytes(b"xs"), b"x".to_vec());
+        let mut out = Vec::new();
+        out.extend(st.feed_bytes(b"3cretVALUE done"));
+        out.extend(st.finish_bytes());
+        assert_eq!(out, b"{{proj/key}} done".to_vec());
     }
 
     #[test]
