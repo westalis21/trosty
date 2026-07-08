@@ -16,12 +16,14 @@ pub fn placeholder(name: &str) -> String {
     format!("{PLACEHOLDER_OPEN}{name}{PLACEHOLDER_CLOSE}")
 }
 
+pub mod audit;
 pub mod error;
 pub mod expand;
 pub mod projects;
 pub mod scrub;
 pub mod vault;
 
+pub use audit::Audit;
 pub use error::CoreError;
 pub use expand::expand;
 pub use projects::{parse_env, ProjectsFile};
