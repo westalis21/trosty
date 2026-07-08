@@ -27,7 +27,7 @@ pub use audit::Audit;
 pub use error::CoreError;
 pub use expand::expand;
 pub use projects::{parse_env, ProjectsFile};
-pub use scrub::Scrubber;
+pub use scrub::{Scrubber, SwappableStream};
 pub use vault::{KeyringStore, MemoryStore, SecretName, SecretStore, MIN_SECRET_LEN};
 
 #[cfg(test)]

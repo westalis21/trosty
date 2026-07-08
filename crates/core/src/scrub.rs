@@ -100,45 +100,50 @@ pub struct StreamScrubber<'a> {
     carry: Vec<u8>,
 }
 
+/// Shared logic for feeding a chunk into a stream scrubber.
+/// Appends chunk to carry, computes prefix-aware hold, emits scrubbed bytes, drains carry.
+fn stream_feed(scrubber: &Scrubber, carry: &mut Vec<u8>, chunk: &[u8]) -> Vec<u8> {
+    carry.extend_from_slice(chunk);
+
+    // Hold back only the longest suffix of the carry that could still
+    // grow into a pattern — i.e. that is a STRICT prefix of some
+    // pattern (a full-length match would already have been found by
+    // find_iter below, so only a shorter, still-extendable prefix
+    // matters here). Everything else is safe to flush now: it cannot
+    // ever become part of a masked match no matter what bytes arrive
+    // next. This is what keeps an interactive prompt from lagging by
+    // (max_pattern_len - 1) bytes with nothing held.
+    let cap = scrubber.max_pattern_len().saturating_sub(1);
+    let limit = cap.min(carry.len());
+    let mut hold = 0usize;
+    for k in (1..=limit).rev() {
+        let suffix = &carry[carry.len() - k..];
+        if scrubber
+            .patterns
+            .iter()
+            .any(|p| p.len() > k && p.starts_with(suffix))
+        {
+            hold = k;
+            break;
+        }
+    }
+
+    let mut cut = carry.len() - hold;
+    if let Some(ac) = &scrubber.ac {
+        for m in ac.find_iter(&carry) {
+            if m.start() < cut && m.end() > cut {
+                cut = m.start();
+            }
+        }
+    }
+    let emit = scrubber.scrub_bytes(&carry[..cut]);
+    carry.drain(..cut);
+    emit
+}
+
 impl StreamScrubber<'_> {
     pub fn feed_bytes(&mut self, chunk: &[u8]) -> Vec<u8> {
-        self.carry.extend_from_slice(chunk);
-
-        // Hold back only the longest suffix of the carry that could still
-        // grow into a pattern — i.e. that is a STRICT prefix of some
-        // pattern (a full-length match would already have been found by
-        // find_iter below, so only a shorter, still-extendable prefix
-        // matters here). Everything else is safe to flush now: it cannot
-        // ever become part of a masked match no matter what bytes arrive
-        // next. This is what keeps an interactive prompt from lagging by
-        // (max_pattern_len - 1) bytes with nothing held.
-        let cap = self.scrubber.max_pattern_len().saturating_sub(1);
-        let limit = cap.min(self.carry.len());
-        let mut hold = 0usize;
-        for k in (1..=limit).rev() {
-            let suffix = &self.carry[self.carry.len() - k..];
-            if self
-                .scrubber
-                .patterns
-                .iter()
-                .any(|p| p.len() > k && p.starts_with(suffix))
-            {
-                hold = k;
-                break;
-            }
-        }
-
-        let mut cut = self.carry.len() - hold;
-        if let Some(ac) = &self.scrubber.ac {
-            for m in ac.find_iter(&self.carry) {
-                if m.start() < cut && m.end() > cut {
-                    cut = m.start();
-                }
-            }
-        }
-        let emit = self.scrubber.scrub_bytes(&self.carry[..cut]);
-        self.carry.drain(..cut);
-        emit
+        stream_feed(self.scrubber, &mut self.carry, chunk)
     }
 
     pub fn finish_bytes(self) -> Vec<u8> {
@@ -156,6 +161,32 @@ impl StreamScrubber<'_> {
 
     pub fn finish(self) -> String {
         String::from_utf8_lossy(&self.finish_bytes()).into_owned()
+    }
+}
+
+pub struct SwappableStream {
+    scrubber: std::sync::Arc<Scrubber>,
+    carry: Vec<u8>,
+}
+
+impl SwappableStream {
+    pub fn new(scrubber: std::sync::Arc<Scrubber>) -> Self {
+        Self {
+            scrubber,
+            carry: Vec::new(),
+        }
+    }
+
+    pub fn feed_bytes(&mut self, chunk: &[u8]) -> Vec<u8> {
+        stream_feed(&self.scrubber, &mut self.carry, chunk)
+    }
+
+    pub fn set_scrubber(&mut self, scrubber: std::sync::Arc<Scrubber>) {
+        self.scrubber = scrubber; // carry intentionally preserved
+    }
+
+    pub fn finish_bytes(self) -> Vec<u8> {
+        self.scrubber.scrub_bytes(&self.carry)
     }
 }
 
@@ -286,5 +317,39 @@ mod tests {
         out.extend(st.finish_bytes());
         let expected: Vec<u8> = [&[0xD0, 0xBF][..], b"{{proj/key}}", b"!"].concat();
         assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn swappable_swap_mid_stream_masks_new_secret() {
+        use std::sync::Arc;
+        let old = Arc::new(Scrubber::new(&[]));
+        let n = SecretName::from_str("proj/key").unwrap();
+        let new = Arc::new(Scrubber::new(&[(n, "s3cretVALUE".into())]));
+        let mut st = SwappableStream::new(old);
+        let mut out = Vec::new();
+        out.extend(st.feed_bytes(b"before s3cretVALUE after;"));
+        st.set_scrubber(new);
+        out.extend(st.feed_bytes(b" now s3cret"));
+        out.extend(st.feed_bytes(b"VALUE end"));
+        out.extend(st.finish_bytes());
+        let s = String::from_utf8(out).unwrap();
+        // before swap: unmasked (no secrets registered then)
+        assert!(s.starts_with("before s3cretVALUE after;"));
+        // after swap: masked, even split across chunks
+        assert!(s.ends_with(" now {{proj/key}} end"), "got: {s}");
+    }
+
+    #[test]
+    fn swappable_preserves_carry_across_swap() {
+        use std::sync::Arc;
+        let n = SecretName::from_str("proj/key").unwrap();
+        let sc = Arc::new(Scrubber::new(&[(n.clone(), "s3cretVALUE".into())]));
+        let mut st = SwappableStream::new(sc.clone());
+        let mut out = Vec::new();
+        out.extend(st.feed_bytes(b"x s3cret")); // "s3cret" held (prefix of pattern)
+        st.set_scrubber(sc); // same scrubber, swap must not flush carry raw
+        out.extend(st.feed_bytes(b"VALUE y"));
+        out.extend(st.finish_bytes());
+        assert_eq!(String::from_utf8(out).unwrap(), "x {{proj/key}} y");
     }
 }
