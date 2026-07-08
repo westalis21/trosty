@@ -72,6 +72,51 @@ impl Scrubber {
             }
         }
     }
+
+    pub fn stream(&self) -> StreamScrubber<'_> {
+        StreamScrubber {
+            scrubber: self,
+            carry: String::new(),
+        }
+    }
+}
+
+pub struct StreamScrubber<'a> {
+    scrubber: &'a Scrubber,
+    carry: String,
+}
+
+impl StreamScrubber<'_> {
+    /// Feed a chunk; returns masked text that is safe to emit now.
+    /// Holds back up to (max_pattern_len - 1) trailing bytes in case a
+    /// secret is split across chunk boundaries.
+    pub fn feed(&mut self, chunk: &str) -> String {
+        self.carry.push_str(chunk);
+        let hold = self.scrubber.max_pattern_len().saturating_sub(1);
+        if self.carry.len() <= hold {
+            return String::new();
+        }
+        // Candidate cut point: everything except the held tail.
+        let mut cut = self.carry.len() - hold;
+        while !self.carry.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        // Don't cut through a match that starts before `cut`.
+        if let Some(ac) = &self.scrubber.ac {
+            for m in ac.find_iter(&self.carry) {
+                if m.start() < cut && m.end() > cut {
+                    cut = m.start();
+                }
+            }
+        }
+        let emit: String = self.scrubber.scrub(&self.carry[..cut]);
+        self.carry.drain(..cut);
+        emit
+    }
+
+    pub fn finish(self) -> String {
+        self.scrubber.scrub(&self.carry)
+    }
 }
 
 #[cfg(test)]
@@ -110,5 +155,28 @@ mod tests {
     #[test]
     fn plain_text_untouched() {
         assert_eq!(scr().scrub("nothing here"), "nothing here");
+    }
+
+    #[test]
+    fn stream_masks_value_split_across_chunks() {
+        let s = scr();
+        let mut st = s.stream();
+        let mut out = String::new();
+        out.push_str(&st.feed("token=s3cret"));
+        out.push_str(&st.feed("VALUE;done"));
+        out.push_str(&st.finish());
+        assert_eq!(out, "token={{proj/key}};done");
+    }
+
+    #[test]
+    fn stream_passes_clean_text_through() {
+        let s = scr();
+        let mut st = s.stream();
+        let mut out = String::new();
+        for chunk in ["hello ", "wor", "ld"] {
+            out.push_str(&st.feed(chunk));
+        }
+        out.push_str(&st.finish());
+        assert_eq!(out, "hello world");
     }
 }
