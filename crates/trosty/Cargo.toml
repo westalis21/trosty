@@ -10,7 +10,9 @@ authors.workspace = true
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+crossterm = "0.29"
 dirs = "6"
+portable-pty = "0.9"
 rpassword = "7"
 trosty-core = { path = "../core" }
 

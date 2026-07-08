@@ -4,6 +4,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use trosty_core::{Audit, KeyringStore, MemoryStore, SecretName, SecretStore};
 
+mod session;
+
 #[derive(Parser)]
 #[command(
     name = "trosty",
@@ -65,6 +67,28 @@ fn data_dir() -> PathBuf {
         .unwrap_or_else(|| dirs::data_dir().expect("data dir").join("trosty"))
 }
 
+/// Build the secret store: an in-memory store (optionally pre-seeded via
+/// `TROSTY_SEED`, tests only) when `TROSTY_MEMORY_STORE` is set, otherwise
+/// the real OS keychain. `TROSTY_SEED` is only honored alongside
+/// `TROSTY_MEMORY_STORE` — never let a stray env var seed the real keychain.
+fn open_store() -> Result<Box<dyn SecretStore>> {
+    if std::env::var_os("TROSTY_MEMORY_STORE").is_some() {
+        let mut store = MemoryStore::new();
+        if let Ok(seed) = std::env::var("TROSTY_SEED") {
+            for pair in seed.split(',') {
+                if let Some((n, v)) = pair.split_once('=') {
+                    store.set(&SecretName::from_str(n)?, v)?;
+                }
+            }
+        }
+        Ok(Box::new(store))
+    } else {
+        Ok(Box::new(
+            KeyringStore::open(&config_dir()).context("open keyring store")?,
+        ))
+    }
+}
+
 /// Extract valid `{{name}}` placeholder names from a string.
 fn placeholder_names(text: &str) -> Vec<String> {
     let mut names = Vec::new();
@@ -87,26 +111,15 @@ fn placeholder_names(text: &str) -> Vec<String> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let Some(cmd) = cli.command else {
-        println!("trosty {} — early development", env!("CARGO_PKG_VERSION"));
-        println!("PTY session is coming; for now see `trosty --help`.");
-        return Ok(());
+        let store = open_store()?;
+        let secrets = collect_secrets(store.as_ref())?; // fail-closed before any child spawns
+        let projects = trosty_core::ProjectsFile::open(&config_dir())?;
+        let audit = Audit::open(&data_dir());
+        let code = session::run(&secrets, &projects, &audit)?;
+        std::process::exit(code);
     };
-    let mut store: Box<dyn SecretStore> = if std::env::var_os("TROSTY_MEMORY_STORE").is_some() {
-        Box::new(MemoryStore::new())
-    } else {
-        Box::new(KeyringStore::open(&config_dir()).context("open keyring store")?)
-    };
+    let mut store = open_store()?;
     let audit = Audit::open(&data_dir());
-
-    if std::env::var_os("TROSTY_MEMORY_STORE").is_some() {
-        if let Ok(seed) = std::env::var("TROSTY_SEED") {
-            for pair in seed.split(',') {
-                if let Some((n, v)) = pair.split_once('=') {
-                    store.set(&SecretName::from_str(n)?, v)?;
-                }
-            }
-        }
-    }
 
     match cmd {
         Cmd::Add { name } => {
