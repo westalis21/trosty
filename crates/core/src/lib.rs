@@ -16,6 +16,12 @@ pub fn placeholder(name: &str) -> String {
     format!("{PLACEHOLDER_OPEN}{name}{PLACEHOLDER_CLOSE}")
 }
 
+pub mod error;
+pub mod vault;
+
+pub use error::CoreError;
+pub use vault::{MemoryStore, SecretName, SecretStore, MIN_SECRET_LEN};
+
 #[cfg(test)]
 mod tests {
     use super::*;
