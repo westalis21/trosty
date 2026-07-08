@@ -45,9 +45,10 @@ environment at all), then a localhost reverse-proxy with API-key custody.
 
 ## Development
 
-```
-cargo test --workspace
-cargo clippy --workspace --all-targets
+```sh
+cargo test --workspace          # unit + CLI integration tests
+cargo test -- --ignored         # real-keychain roundtrip (manual, macOS)
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 ## License
