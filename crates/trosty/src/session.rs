@@ -2,7 +2,15 @@ use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, Child, CommandBuilder, PtySize};
 use std::io::{Read, Write};
 use std::sync::mpsc;
+use std::time::Duration;
 use trosty_core::{Audit, ProjectsFile, Scrubber, SecretName};
+
+enum SessionEvent {
+    Output(Vec<u8>),
+    Eof,
+    Resize,
+    Peek,
+}
 
 fn shell_command() -> CommandBuilder {
     let shell = std::env::var("TROSTY_SHELL")
@@ -87,7 +95,7 @@ pub fn run(
     projects: &ProjectsFile,
     audit: &Audit,
 ) -> Result<i32> {
-    let scrubber = Scrubber::new(secrets);
+    let scrubber = std::sync::Arc::new(Scrubber::new(secrets));
     let project = std::env::current_dir()
         .ok()
         .and_then(|d| projects.project_for(&d));
@@ -118,8 +126,10 @@ pub fn run(
     let raw = crossterm::terminal::enable_raw_mode().is_ok();
     let _raw_guard = RawModeGuard(raw);
 
-    // stdin → pty (verbatim)
+    // stdin → pty (with Ctrl+G interception)
     let mut pty_writer = pty.master.take_writer().context("pty writer")?;
+    let (tx, rx) = mpsc::channel::<SessionEvent>();
+    let tx_stdin = tx.clone();
     std::thread::spawn(move || {
         let mut stdin = std::io::stdin();
         let mut buf = [0u8; 4096];
@@ -127,7 +137,17 @@ pub fn run(
             match stdin.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if pty_writer.write_all(&buf[..n]).is_err() {
+                    let mut start = 0;
+                    for i in 0..n {
+                        if buf[i] == 0x07 {
+                            if pty_writer.write_all(&buf[start..i]).is_err() {
+                                return;
+                            }
+                            let _ = tx_stdin.send(SessionEvent::Peek);
+                            start = i + 1;
+                        }
+                    }
+                    if pty_writer.write_all(&buf[start..n]).is_err() {
                         break;
                     }
                 }
@@ -136,25 +156,27 @@ pub fn run(
     });
 
     // pty → screen (masked). Reader thread sends chunks; main loop writes,
-    // so `finish_bytes` can flush the tail after EOF. `None` is an explicit
-    // EOF sentinel from the reader thread — the loop below can't rely on
-    // "all senders dropped" to end, since the SIGWINCH thread also holds a
+    // so `finish_bytes` can flush the tail after EOF. SessionEvent::Eof is an
+    // explicit EOF sentinel from the reader thread — the loop below can't rely
+    // on "all senders dropped" to end, since the SIGWINCH thread also holds a
     // sender for the life of the process (it blocks in `signals.forever()`
     // and never exits on its own, so the channel would otherwise never
     // disconnect and the loop would hang forever after the shell exits).
     let mut pty_reader = pty.master.try_clone_reader().context("pty reader")?;
-    let (tx, rx) = mpsc::channel::<Option<Vec<u8>>>();
     let tx_reader = tx.clone();
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
         loop {
             match pty_reader.read(&mut buf) {
                 Ok(0) | Err(_) => {
-                    let _ = tx_reader.send(None);
+                    let _ = tx_reader.send(SessionEvent::Eof);
                     break;
                 }
                 Ok(n) => {
-                    if tx_reader.send(Some(buf[..n].to_vec())).is_err() {
+                    if tx_reader
+                        .send(SessionEvent::Output(buf[..n].to_vec()))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -163,7 +185,7 @@ pub fn run(
     });
 
     // On unix, resize the pty exactly when the terminal tells us to (SIGWINCH),
-    // via an empty-Vec marker on the same channel the reader thread uses —
+    // via a Resize event on the same channel the reader thread uses —
     // no separate synchronization needed, and no per-chunk poll. Windows has
     // no SIGWINCH, so it keeps the poll-per-chunk fallback below.
     #[cfg(unix)]
@@ -174,25 +196,35 @@ pub fn run(
         let tx_resize = tx.clone();
         std::thread::spawn(move || {
             for _ in signals.forever() {
-                // empty chunk = "just resize" marker
-                if tx_resize.send(Some(Vec::new())).is_err() {
+                if tx_resize.send(SessionEvent::Resize).is_err() {
                     break;
                 }
             }
         });
     }
 
-    let mut stream = scrubber.stream();
-    while let Ok(Some(chunk)) = rx.recv() {
-        if chunk.is_empty() {
-            let _ = pty.master.resize(term_size());
-            continue;
+    let mut stream = trosty_core::SwappableStream::new(scrubber.clone());
+    loop {
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(SessionEvent::Output(chunk)) => {
+                let masked = stream.feed_bytes(&chunk);
+                if stdout.write_all(&masked).is_err() {
+                    break;
+                }
+                let _ = stdout.flush();
+            }
+            Ok(SessionEvent::Eof) => break,
+            Ok(SessionEvent::Resize) => {
+                let _ = pty.master.resize(term_size());
+            }
+            Ok(SessionEvent::Peek) => {
+                // handled in Plan 2b Task 4
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // tick point for later tasks
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
-        let masked = stream.feed_bytes(&chunk);
-        if stdout.write_all(&masked).is_err() {
-            break;
-        }
-        let _ = stdout.flush();
         // Windows has no SIGWINCH; keep polling per chunk so resize still
         // tracks the real terminal there.
         #[cfg(windows)]
