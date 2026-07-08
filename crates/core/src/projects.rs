@@ -50,6 +50,11 @@ impl ProjectsFile {
     }
 
     pub fn set(&mut self, dir: &Path, project: &str) -> Result<(), CoreError> {
+        if dir.as_os_str().is_empty() {
+            return Err(CoreError::InvalidProjectDir(
+                "project dir must not be empty".into(),
+            ));
+        }
         self.map.insert(dir.to_path_buf(), project.to_string());
         let doc: BTreeMap<String, String> = self
             .map
@@ -112,5 +117,13 @@ mod tests {
             p2.project_for(std::path::Path::new("/home/r/code")),
             Some("generic".to_string())
         );
+    }
+
+    #[test]
+    fn set_rejects_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = ProjectsFile::open(dir.path()).unwrap();
+        let err = p.set(Path::new(""), "foo").unwrap_err();
+        assert!(matches!(err, CoreError::InvalidProjectDir(_)));
     }
 }

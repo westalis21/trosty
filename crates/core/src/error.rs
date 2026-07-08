@@ -8,6 +8,8 @@ pub enum CoreError {
     TooShort,
     #[error("unknown secret: {0}")]
     UnknownSecret(String),
+    #[error("invalid project directory: {0}")]
+    InvalidProjectDir(String),
     #[error("keyring: {0}")]
     Keyring(String),
     #[error("io: {0}")]

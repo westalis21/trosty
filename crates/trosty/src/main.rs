@@ -44,6 +44,21 @@ fn config_dir() -> PathBuf {
         .unwrap_or_else(|| dirs::config_dir().expect("config dir").join("trosty"))
 }
 
+/// Read every secret currently in the store's index, failing closed if any
+/// value can't be read: a masking pipeline that silently drops a secret it
+/// can't reach would let it through the child process unmasked, which is
+/// worse than refusing to run at all.
+fn collect_secrets(store: &dyn SecretStore) -> Result<Vec<(SecretName, String)>> {
+    let mut secrets = Vec::new();
+    for name in store.list()? {
+        match store.get(&name)? {
+            Some(value) => secrets.push((name, value)),
+            None => bail!("secret {name} in index but unreadable from keychain — refusing to run"),
+        }
+    }
+    Ok(secrets)
+}
+
 fn data_dir() -> PathBuf {
     std::env::var_os("TROSTY_DATA_DIR")
         .map(PathBuf::from)
@@ -64,10 +79,12 @@ fn main() -> Result<()> {
     };
     let audit = Audit::open(&data_dir());
 
-    if let Ok(seed) = std::env::var("TROSTY_SEED") {
-        for pair in seed.split(',') {
-            if let Some((n, v)) = pair.split_once('=') {
-                store.set(&SecretName::from_str(n)?, v)?;
+    if std::env::var_os("TROSTY_MEMORY_STORE").is_some() {
+        if let Ok(seed) = std::env::var("TROSTY_SEED") {
+            for pair in seed.split(',') {
+                if let Some((n, v)) = pair.split_once('=') {
+                    store.set(&SecretName::from_str(n)?, v)?;
+                }
             }
         }
     }
@@ -109,6 +126,8 @@ fn main() -> Result<()> {
         Cmd::Import { file, project } => {
             let content = std::fs::read_to_string(&file)
                 .with_context(|| format!("read {}", file.display()))?;
+            let file = std::fs::canonicalize(&file)
+                .with_context(|| format!("canonicalize {}", file.display()))?;
             let dir = file
                 .parent()
                 .map(std::path::Path::to_path_buf)
@@ -141,11 +160,7 @@ fn main() -> Result<()> {
                 }
                 expanded.push(e);
             }
-            let secrets: Vec<(SecretName, String)> = store
-                .list()?
-                .into_iter()
-                .filter_map(|n| store.get(&n).ok().flatten().map(|v| (n, v)))
-                .collect();
+            let secrets = collect_secrets(store.as_ref())?;
             let scrubber = trosty_core::Scrubber::new(&secrets);
             let (program, args) = expanded.split_first().expect("clap requires cmd");
             let mut child = std::process::Command::new(program)

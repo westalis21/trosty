@@ -15,7 +15,10 @@ fn variants(value: &str) -> Vec<String> {
         value.to_string(),
         base64::engine::general_purpose::STANDARD.encode(value),
         base64::engine::general_purpose::STANDARD_NO_PAD.encode(value),
+        base64::engine::general_purpose::URL_SAFE.encode(value),
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value),
         hex::encode(value),
+        hex::encode_upper(value),
         utf8_percent_encode(value, NON_ALPHANUMERIC).to_string(),
     ];
     out.sort();
@@ -139,8 +142,26 @@ mod tests {
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD.encode("s3cretVALUE");
         let hexed = hex::encode("s3cretVALUE");
-        let out = scr().scrub(&format!("a {b64} b {hexed} c"));
-        assert_eq!(out, "a {{proj/key}} b {{proj/key}} c");
+        let hexed_upper = hex::encode_upper("s3cretVALUE");
+        let out = scr().scrub(&format!("a {b64} b {hexed} c {hexed_upper} d"));
+        assert_eq!(out, "a {{proj/key}} b {{proj/key}} c {{proj/key}} d");
+    }
+
+    #[test]
+    fn masks_url_safe_base64() {
+        use base64::Engine;
+        // Value chosen so its standard base64 uses '+' where url-safe base64
+        // uses '-' — proves the URL_SAFE variant is matched, not just STANDARD.
+        let n = SecretName::from_str("proj/key").unwrap();
+        let value = "P(,+n|@B>,";
+        let standard = base64::engine::general_purpose::STANDARD.encode(value);
+        let url_safe = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value);
+        assert_ne!(
+            standard, url_safe,
+            "fixture must exercise the url-safe alphabet"
+        );
+        let s = Scrubber::new(&[(n, value.into())]);
+        assert_eq!(s.scrub(&format!("a {url_safe} b")), "a {{proj/key}} b");
     }
 
     #[test]
