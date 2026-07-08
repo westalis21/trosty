@@ -49,3 +49,35 @@ fn import_env_file_reports_names_only() {
         "value must never be printed"
     );
 }
+
+#[test]
+fn exec_expands_and_masks() {
+    let dir = tempfile::tempdir().unwrap();
+    // seed a secret via import (memory store persists only per-process, so
+    // exec test uses TROSTY_SEED to inject: name=value)
+    let mut cmd = Command::cargo_bin("trosty").unwrap();
+    let assert = cmd
+        .env("TROSTY_CONFIG_DIR", dir.path())
+        .env("TROSTY_DATA_DIR", dir.path())
+        .env("TROSTY_MEMORY_STORE", "1")
+        .env("TROSTY_SEED", "proj/key=supersecret9")
+        .args(["exec", "--", "echo", "value is {{proj/key}}"])
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    // echo received the real value, but trosty masked it back on the way out
+    assert!(out.contains("value is {{proj/key}}"));
+    assert!(!out.contains("supersecret9"));
+}
+
+#[test]
+fn exec_unknown_placeholder_runs_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cmd = Command::cargo_bin("trosty").unwrap();
+    cmd.env("TROSTY_CONFIG_DIR", dir.path())
+        .env("TROSTY_DATA_DIR", dir.path())
+        .env("TROSTY_MEMORY_STORE", "1")
+        .args(["exec", "--", "echo", "{{proj/nope}}"])
+        .assert()
+        .failure();
+}

@@ -31,6 +31,11 @@ enum Cmd {
         #[arg(long)]
         project: String,
     },
+    /// Run a command with {{name}} expanded; its output is masked back
+    Exec {
+        #[arg(trailing_var_arg = true, required = true)]
+        cmd: Vec<String>,
+    },
 }
 
 fn config_dir() -> PathBuf {
@@ -58,6 +63,14 @@ fn main() -> Result<()> {
         Box::new(KeyringStore::open(&config_dir()).context("open keyring store")?)
     };
     let audit = Audit::open(&data_dir());
+
+    if let Ok(seed) = std::env::var("TROSTY_SEED") {
+        for pair in seed.split(',') {
+            if let Some((n, v)) = pair.split_once('=') {
+                store.set(&SecretName::from_str(n)?, v)?;
+            }
+        }
+    }
 
     match cmd {
         Cmd::Add { name } => {
@@ -118,6 +131,55 @@ fn main() -> Result<()> {
             let mut projects = trosty_core::ProjectsFile::open(&config_dir())?;
             projects.set(&dir, &project)?;
             println!("{imported} secrets → namespace {project}/, project dir registered");
+        }
+        Cmd::Exec { cmd } => {
+            let mut expanded = Vec::with_capacity(cmd.len());
+            for arg in &cmd {
+                let e = trosty_core::expand(arg, store.as_ref())?;
+                if e != *arg {
+                    audit.log("expanded", arg);
+                }
+                expanded.push(e);
+            }
+            let secrets: Vec<(SecretName, String)> = store
+                .list()?
+                .into_iter()
+                .filter_map(|n| store.get(&n).ok().flatten().map(|v| (n, v)))
+                .collect();
+            let scrubber = trosty_core::Scrubber::new(&secrets);
+            let (program, args) = expanded.split_first().expect("clap requires cmd");
+            let mut child = std::process::Command::new(program)
+                .args(args)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .with_context(|| format!("spawn {program}"))?;
+
+            use std::io::Read;
+            let mask_pipe = |mut r: Box<dyn Read>, mut w: Box<dyn std::io::Write>| {
+                let mut stream = scrubber.stream();
+                let mut buf = [0u8; 8192];
+                loop {
+                    match r.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let text = String::from_utf8_lossy(&buf[..n]);
+                            let masked = stream.feed(&text);
+                            let _ = w.write_all(masked.as_bytes());
+                        }
+                    }
+                }
+                let _ = w.write_all(stream.finish().as_bytes());
+                let _ = w.flush();
+            };
+            let stdout = child.stdout.take().expect("piped");
+            let stderr = child.stderr.take().expect("piped");
+            std::thread::scope(|s| {
+                s.spawn(|| mask_pipe(Box::new(stdout), Box::new(std::io::stdout())));
+                s.spawn(|| mask_pipe(Box::new(stderr), Box::new(std::io::stderr())));
+            });
+            let status = child.wait()?;
+            std::process::exit(status.code().unwrap_or(1));
         }
     }
     Ok(())
