@@ -7,5 +7,5 @@
   chunk-boundary-safe streaming), expander (fail-closed), .env parsing,
   dir→project mapping, append-only audit log.
 - CLI: `add`, `ls`, `rm`, `import --project`, `exec --`, `doctor`.
-- Known limitation: `exec` output masking may mangle non-ASCII characters
-  split across read boundaries; secrets themselves are matched as ASCII.
+- Known limitation: output masking is byte-level; non-ASCII output and
+  non-ASCII secrets are masked correctly.

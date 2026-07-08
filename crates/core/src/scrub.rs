@@ -59,52 +59,49 @@ impl Scrubber {
         self.max_len
     }
 
-    pub fn scrub(&self, text: &str) -> String {
+    pub fn scrub_bytes(&self, data: &[u8]) -> Vec<u8> {
         match &self.ac {
-            None => text.to_string(),
+            None => data.to_vec(),
             Some(ac) => {
-                let mut out = String::with_capacity(text.len());
+                let mut out = Vec::with_capacity(data.len());
                 let mut last = 0;
-                for m in ac.find_iter(text) {
-                    out.push_str(&text[last..m.start()]);
-                    out.push_str(&self.replacements[m.pattern().as_usize()]);
+                for m in ac.find_iter(data) {
+                    out.extend_from_slice(&data[last..m.start()]);
+                    out.extend_from_slice(self.replacements[m.pattern().as_usize()].as_bytes());
                     last = m.end();
                 }
-                out.push_str(&text[last..]);
+                out.extend_from_slice(&data[last..]);
                 out
             }
         }
     }
 
+    pub fn scrub(&self, text: &str) -> String {
+        String::from_utf8(self.scrub_bytes(text.as_bytes()))
+            .expect("placeholders are valid UTF-8 and input was valid UTF-8")
+    }
+
     pub fn stream(&self) -> StreamScrubber<'_> {
         StreamScrubber {
             scrubber: self,
-            carry: String::new(),
+            carry: Vec::new(),
         }
     }
 }
 
 pub struct StreamScrubber<'a> {
     scrubber: &'a Scrubber,
-    carry: String,
+    carry: Vec<u8>,
 }
 
 impl StreamScrubber<'_> {
-    /// Feed a chunk; returns masked text that is safe to emit now.
-    /// Holds back up to (max_pattern_len - 1) trailing bytes in case a
-    /// secret is split across chunk boundaries.
-    pub fn feed(&mut self, chunk: &str) -> String {
-        self.carry.push_str(chunk);
+    pub fn feed_bytes(&mut self, chunk: &[u8]) -> Vec<u8> {
+        self.carry.extend_from_slice(chunk);
         let hold = self.scrubber.max_pattern_len().saturating_sub(1);
         if self.carry.len() <= hold {
-            return String::new();
+            return Vec::new();
         }
-        // Candidate cut point: everything except the held tail.
         let mut cut = self.carry.len() - hold;
-        while !self.carry.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        // Don't cut through a match that starts before `cut`.
         if let Some(ac) = &self.scrubber.ac {
             for m in ac.find_iter(&self.carry) {
                 if m.start() < cut && m.end() > cut {
@@ -112,13 +109,24 @@ impl StreamScrubber<'_> {
                 }
             }
         }
-        let emit: String = self.scrubber.scrub(&self.carry[..cut]);
+        let emit = self.scrubber.scrub_bytes(&self.carry[..cut]);
         self.carry.drain(..cut);
         emit
     }
 
+    pub fn finish_bytes(self) -> Vec<u8> {
+        self.scrubber.scrub_bytes(&self.carry)
+    }
+
+    /// Feed a chunk; returns masked text that is safe to emit now.
+    /// Holds back up to (max_pattern_len - 1) trailing bytes in case a
+    /// secret is split across chunk boundaries.
+    pub fn feed(&mut self, chunk: &str) -> String {
+        String::from_utf8_lossy(&self.feed_bytes(chunk.as_bytes())).into_owned()
+    }
+
     pub fn finish(self) -> String {
-        self.scrubber.scrub(&self.carry)
+        String::from_utf8_lossy(&self.finish_bytes()).into_owned()
     }
 }
 
@@ -199,5 +207,31 @@ mod tests {
         }
         out.push_str(&st.finish());
         assert_eq!(out, "hello world");
+    }
+
+    #[test]
+    fn bytes_masks_secret_between_invalid_utf8() {
+        let s = scr();
+        let mut data = vec![0xFF, 0xFE];
+        data.extend_from_slice(b"s3cretVALUE");
+        data.push(0xFF);
+        let out = s.scrub_bytes(&data);
+        let expected: Vec<u8> = [&[0xFF, 0xFE][..], b"{{proj/key}}", &[0xFF][..]].concat();
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn stream_bytes_split_mid_multibyte_char_around_secret() {
+        // "п" = 0xD0 0xBF; split the stream between its bytes right before the secret
+        let s = scr();
+        let mut st = s.stream();
+        let mut out = Vec::new();
+        out.extend(st.feed_bytes(&[0xD0]));
+        out.extend(st.feed_bytes(&[0xBF]));
+        out.extend(st.feed_bytes(b"s3cret"));
+        out.extend(st.feed_bytes(b"VALUE!"));
+        out.extend(st.finish_bytes());
+        let expected: Vec<u8> = [&[0xD0, 0xBF][..], b"{{proj/key}}", b"!"].concat();
+        assert_eq!(out, expected);
     }
 }
