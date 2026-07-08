@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::str::FromStr;
-use trosty_core::{Audit, KeyringStore, SecretName, SecretStore};
+use trosty_core::{Audit, KeyringStore, MemoryStore, SecretName, SecretStore};
 
 #[derive(Parser)]
 #[command(
@@ -25,6 +25,12 @@ enum Cmd {
     Rm { name: String },
     /// Check that keychain, config and audit are all reachable
     Doctor,
+    /// Import a .env file into a project namespace (values go to the keychain)
+    Import {
+        file: PathBuf,
+        #[arg(long)]
+        project: String,
+    },
 }
 
 fn config_dir() -> PathBuf {
@@ -46,7 +52,11 @@ fn main() -> Result<()> {
         println!("PTY session is coming; for now see `trosty --help`.");
         return Ok(());
     };
-    let mut store = KeyringStore::open(&config_dir()).context("open keyring store")?;
+    let mut store: Box<dyn SecretStore> = if std::env::var_os("TROSTY_MEMORY_STORE").is_some() {
+        Box::new(MemoryStore::new())
+    } else {
+        Box::new(KeyringStore::open(&config_dir()).context("open keyring store")?)
+    };
     let audit = Audit::open(&data_dir());
 
     match cmd {
@@ -82,6 +92,32 @@ fn main() -> Result<()> {
             println!("secrets in index: {}", store.list()?.len());
             println!("keychain: reachable");
             println!("ok");
+        }
+        Cmd::Import { file, project } => {
+            let content = std::fs::read_to_string(&file)
+                .with_context(|| format!("read {}", file.display()))?;
+            let dir = file
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_default();
+            let mut imported = 0usize;
+            for (key, value) in trosty_core::parse_env(&content) {
+                let name = SecretName::from_str(&format!("{project}/{key}"))?;
+                match store.set(&name, &value) {
+                    Ok(()) => {
+                        audit.log("imported", &name.to_string());
+                        println!("imported {name}");
+                        imported += 1;
+                    }
+                    Err(trosty_core::CoreError::TooShort) => {
+                        println!("skipped {key} (too short)");
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            let mut projects = trosty_core::ProjectsFile::open(&config_dir())?;
+            projects.set(&dir, &project)?;
+            println!("{imported} secrets → namespace {project}/, project dir registered");
         }
     }
     Ok(())
