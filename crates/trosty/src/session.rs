@@ -108,16 +108,25 @@ pub fn run(
     });
 
     // pty → screen (masked). Reader thread sends chunks; main loop writes,
-    // so `finish_bytes` can flush the tail after EOF.
+    // so `finish_bytes` can flush the tail after EOF. `None` is an explicit
+    // EOF sentinel from the reader thread — the loop below can't rely on
+    // "all senders dropped" to end, since the SIGWINCH thread also holds a
+    // sender for the life of the process (it blocks in `signals.forever()`
+    // and never exits on its own, so the channel would otherwise never
+    // disconnect and the loop would hang forever after the shell exits).
     let mut pty_reader = pty.master.try_clone_reader().context("pty reader")?;
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let (tx, rx) = mpsc::channel::<Option<Vec<u8>>>();
+    let tx_reader = tx.clone();
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
         loop {
             match pty_reader.read(&mut buf) {
-                Ok(0) | Err(_) => break,
+                Ok(0) | Err(_) => {
+                    let _ = tx_reader.send(None);
+                    break;
+                }
                 Ok(n) => {
-                    if tx.send(buf[..n].to_vec()).is_err() {
+                    if tx_reader.send(Some(buf[..n].to_vec())).is_err() {
                         break;
                     }
                 }
@@ -125,15 +134,43 @@ pub fn run(
         }
     });
 
+    // On unix, resize the pty exactly when the terminal tells us to (SIGWINCH),
+    // via an empty-Vec marker on the same channel the reader thread uses —
+    // no separate synchronization needed, and no per-chunk poll. Windows has
+    // no SIGWINCH, so it keeps the poll-per-chunk fallback below.
+    #[cfg(unix)]
+    {
+        use signal_hook::consts::SIGWINCH;
+        use signal_hook::iterator::Signals;
+        let mut signals = Signals::new([SIGWINCH]).context("install SIGWINCH handler")?;
+        let tx_resize = tx.clone();
+        std::thread::spawn(move || {
+            for _ in signals.forever() {
+                // empty chunk = "just resize" marker
+                if tx_resize.send(Some(Vec::new())).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
     let mut stream = scrubber.stream();
-    for chunk in rx {
+    while let Ok(Some(chunk)) = rx.recv() {
+        if chunk.is_empty() {
+            let _ = pty.master.resize(term_size());
+            continue;
+        }
         let masked = stream.feed_bytes(&chunk);
         if stdout.write_all(&masked).is_err() {
             break;
         }
         let _ = stdout.flush();
-        // keep pty size in sync with the real terminal (cheap poll per chunk)
-        let _ = pty.master.resize(term_size());
+        // Windows has no SIGWINCH; keep polling per chunk so resize still
+        // tracks the real terminal there.
+        #[cfg(windows)]
+        {
+            let _ = pty.master.resize(term_size());
+        }
     }
     let _ = stdout.write_all(&stream.finish_bytes());
     let _ = stdout.flush();

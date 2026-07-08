@@ -1004,6 +1004,7 @@ dependencies = [
  "dirs",
  "portable-pty",
  "rpassword",
+ "signal-hook",
  "tempfile",
  "trosty-core",
 ]

@@ -16,6 +16,9 @@ portable-pty = "0.9"
 rpassword = "7"
 trosty-core = { path = "../core" }
 
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3"
+
 [dev-dependencies]
 assert_cmd = "2"
 tempfile = "3"

@@ -15,14 +15,9 @@ Your AI (and your screen) only ever see secret **names** — `{{stripe_key}}`.
 Real values live in the OS keychain (macOS Keychain / Windows DPAPI / Linux
 libsecret) and appear only at the moment a command actually runs.
 
-```
-$ trosty add stripe_key        # value goes straight to the keychain
-$ trosty                       # start a protected PTY session in your terminal
-
-┌─ rostyslab · 4 secrets · 🔒 ─┐
-$ cat .env
-STRIPE_KEY={{rostyslab/stripe_key}}   # masked live, press peek-key to reveal 3s
-```
+> Status: the PTY session, `add`/`exec`/`import`, and live output masking
+> work today — see **Usage** below. The status line and peek-key shown in
+> earlier mockups are Plan 2b.
 
 - **Paste a real value into an AI chat by accident?** It is masked before the
   prompt leaves your machine (Claude Code hooks integration).
@@ -31,6 +26,15 @@ STRIPE_KEY={{rostyslab/stripe_key}}   # masked live, press peek-key to reveal 3s
 - **Projects:** a directory is a project. trosty spots `.env` files and
   imports them under a namespace (`rostyslab/db_url`) in one keystroke —
   think direnv, but the values never sit in plaintext.
+
+## Usage (v0.1)
+
+```sh
+trosty add demo/key            # value prompted, stored in the OS keychain
+trosty                         # start a protected shell session (live masking)
+trosty exec -- <cmd>           # one-shot: expand {{name}} args, mask output
+trosty import .env --project p # bulk-import into a namespace
+```
 
 ## v0.1 scope
 
