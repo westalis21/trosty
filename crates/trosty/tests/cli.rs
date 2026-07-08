@@ -122,3 +122,39 @@ fn exec_unknown_placeholder_runs_nothing() {
         .assert()
         .failure();
 }
+
+#[test]
+fn exec_masks_secret_inside_binaryish_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cmd = Command::cargo_bin("trosty").unwrap();
+    let assert = cmd
+        .env("TROSTY_CONFIG_DIR", dir.path())
+        .env("TROSTY_DATA_DIR", dir.path())
+        .env("TROSTY_MEMORY_STORE", "1")
+        .env("TROSTY_SEED", "proj/key=supersecret9")
+        .args([
+            "exec",
+            "--",
+            "sh",
+            "-c",
+            "printf 'п\\xffsupersecret9\\xffк'",
+        ])
+        .assert()
+        .success();
+    let out = assert.get_output().stdout.clone();
+
+    // Assert exact byte sequence: [0xD0,0xBF] (п) ++ 0xFF ++ b"{{proj/key}}" ++ 0xFF ++ [0xD0,0xBA] (к)
+    let expected = [
+        &[0xD0u8, 0xBFu8] as &[u8],
+        &[0xFFu8],
+        b"{{proj/key}}",
+        &[0xFFu8],
+        &[0xD0u8, 0xBAu8],
+    ]
+    .concat();
+    assert_eq!(
+        out, expected,
+        "output bytes don't match. got: {:?}, expected: {:?}",
+        out, expected
+    );
+}

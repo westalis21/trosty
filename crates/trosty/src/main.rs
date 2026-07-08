@@ -201,13 +201,12 @@ fn main() -> Result<()> {
                     match r.read(&mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
-                            let text = String::from_utf8_lossy(&buf[..n]);
-                            let masked = stream.feed(&text);
-                            let _ = w.write_all(masked.as_bytes());
+                            let masked = stream.feed_bytes(&buf[..n]);
+                            let _ = w.write_all(&masked);
                         }
                     }
                 }
-                let _ = w.write_all(stream.finish().as_bytes());
+                let _ = w.write_all(&stream.finish_bytes());
                 let _ = w.flush();
             };
             let stdout = child.stdout.take().expect("piped");
