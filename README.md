@@ -40,8 +40,16 @@ STRIPE_KEY={{rostyslab/stripe_key}}   # masked live, press peek-key to reveal 3s
 - Claude Code hooks adapter (prompt + tool-output masking)
 - Fail-closed everywhere: if protection can't run, the operation doesn't
 
-Later layers: placeholders-in-env (real values never enter the AI's
-environment at all), then a localhost reverse-proxy with API-key custody.
+## Roadmap after v0.1
+
+- **v0.1.1 — API-key custody proxy:** localhost reverse-proxy; tools get
+  `ANTHROPIC_BASE_URL=127.0.0.1` + a fake key, the real key lives in the
+  keychain and is swapped in on egress; outbound requests scrubbed.
+- **Placeholders-in-env (tracked, known v0.1 gap):** today a child
+  process still sees real values in its environment. This layer replaces
+  them with references that resolve only at egress / via per-protocol
+  shims — `echo $KEY` will have nothing to leak.
+- Then: TUI manager, per-tool virtual keys, spend limits, audit viewer.
 
 ## Development
 
