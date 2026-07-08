@@ -91,10 +91,17 @@ fn exec_refuses_to_run_when_indexed_secret_unreadable() {
         .args(["exec", "--", "echo", "hi"])
         .assert()
         .failure();
-    let err = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    let output = assert.get_output();
+    // The fail-closed property: the child must never have run. The exact
+    // stderr differs by platform (macOS: NoEntry -> named secret; headless
+    // Linux CI: no secret-service daemon -> keyring error), and both are
+    // legitimate refusals.
+    let out = String::from_utf8(output.stdout.clone()).unwrap();
+    assert!(!out.contains("hi"), "child ran despite unreadable secret");
+    let err = String::from_utf8(output.stderr.clone()).unwrap();
     assert!(
-        err.contains("trosty_test_missing/only_in_index"),
-        "stderr should name the unreadable secret, got: {err}"
+        err.contains("trosty_test_missing/only_in_index") || err.contains("keyring"),
+        "stderr should explain the refusal, got: {err}"
     );
 }
 
