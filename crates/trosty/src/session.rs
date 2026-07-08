@@ -37,6 +37,19 @@ fn term_size() -> PtySize {
     }
 }
 
+/// Restores raw mode on drop, so any early return via `?` after raw mode is
+/// enabled (e.g. `take_writer`/`try_clone_reader`/`child.wait` failing)
+/// still leaves the caller's terminal usable instead of stuck in raw mode.
+struct RawModeGuard(bool);
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+    }
+}
+
 /// Run an interactive shell session inside a PTY, masking known secrets on
 /// the way to the screen. `collect_secrets` (main.rs) is called by the
 /// caller before this runs — this function receives the already-collected
@@ -72,8 +85,10 @@ pub fn run(
     let _ = stdout.flush();
 
     // Raw mode only when stdin is a real TTY (tests drive us inside a PTY,
-    // which IS a tty; a plain pipe is not — then skip raw mode).
+    // which IS a tty; a plain pipe is not — then skip raw mode). The guard
+    // restores it on every exit path, including early returns below.
     let raw = crossterm::terminal::enable_raw_mode().is_ok();
+    let _raw_guard = RawModeGuard(raw);
 
     // stdin → pty (verbatim)
     let mut pty_writer = pty.master.take_writer().context("pty writer")?;
@@ -123,6 +138,9 @@ pub fn run(
     let _ = stdout.write_all(&stream.finish_bytes());
     let _ = stdout.flush();
 
+    // Explicit disable on the happy path (in addition to the guard) so the
+    // terminal is restored before the shell's exit status is observed, not
+    // just at function return; disabling twice is harmless.
     if raw {
         let _ = crossterm::terminal::disable_raw_mode();
     }
