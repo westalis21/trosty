@@ -17,10 +17,12 @@ pub fn placeholder(name: &str) -> String {
 }
 
 pub mod error;
+pub mod expand;
 pub mod scrub;
 pub mod vault;
 
 pub use error::CoreError;
+pub use expand::expand;
 pub use scrub::Scrubber;
 pub use vault::{KeyringStore, MemoryStore, SecretName, SecretStore, MIN_SECRET_LEN};
 
