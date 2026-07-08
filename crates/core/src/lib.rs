@@ -22,6 +22,9 @@ mod tests {
 
     #[test]
     fn placeholder_is_canonical() {
-        assert_eq!(placeholder("rostyslab/stripe_key"), "{{rostyslab/stripe_key}}");
+        assert_eq!(
+            placeholder("rostyslab/stripe_key"),
+            "{{rostyslab/stripe_key}}"
+        );
     }
 }
