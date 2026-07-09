@@ -10,6 +10,9 @@ use trosty_core::{Audit, ProjectsFile, Scrubber, SecretName};
 enum SessionEvent {
     Output(Vec<u8>),
     Eof,
+    // Only produced by the unix SIGWINCH thread; on Windows the terminal is
+    // polled instead, so the variant is never constructed there.
+    #[cfg_attr(windows, allow(dead_code))]
     Resize,
     Peek,
 }
