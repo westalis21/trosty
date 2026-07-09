@@ -201,3 +201,113 @@ fn hot_reload_picks_up_new_secret() {
         "after reload must be masked: {out:?}"
     );
 }
+
+/// Regression test for the hot-reload starvation bug: the stat/reload +
+/// peek-expiry logic used to run only in the `RecvTimeoutError::Timeout`
+/// arm of the event loop, which never fires while the pty keeps producing
+/// output faster than the 250ms recv timeout. A newly-added secret was
+/// therefore never picked up while the shell stayed busy. Here the inner
+/// shell prints the not-yet-secret value every 50ms for ~4s — far busier
+/// than the 250ms timeout — while the seed file gains the matching secret
+/// partway through. The fix (`tick` called at the bottom of every loop
+/// iteration, not just on Timeout) must still notice the change and mask
+/// later occurrences, while earlier occurrences (before the seed file was
+/// updated) remain unmasked proof the secret really didn't exist yet.
+#[test]
+fn hot_reload_masks_during_busy_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let seed = dir.path().join("seeds.txt");
+    std::fs::write(&seed, "proj/key=supersecret9\n").unwrap();
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut cmd = CommandBuilder::new(cargo_bin("trosty"));
+    cmd.env("TROSTY_CONFIG_DIR", dir.path());
+    cmd.env("TROSTY_DATA_DIR", dir.path());
+    cmd.env("TROSTY_MEMORY_STORE", "1");
+    cmd.env("TROSTY_SEED_FILE", &seed);
+    cmd.env("TROSTY_NO_STATUS", "1");
+    cmd.env("TROSTY_SHELL", "/bin/sh");
+    // Busy inner "shell": prints the soon-to-exist secret every 50ms for
+    // ~4s, i.e. far more often than the 250ms recv_timeout — this is what
+    // used to starve the Timeout-only reload check.
+    cmd.env(
+        "TROSTY_SHELL_ARGS",
+        "-c,i=0; while [ $i -lt 80 ]; do echo line newsecret42; sleep 0.05; i=$((i+1)); done",
+    );
+    let mut child = pty.slave.spawn_command(cmd).unwrap();
+    drop(pty.slave);
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    std::fs::write(&seed, "proj/key=supersecret9\nproj/new=newsecret42\n").unwrap();
+    let mut out = String::new();
+    let mut reader = pty.master.try_clone_reader().unwrap();
+    reader.read_to_string(&mut out).ok();
+    child.wait().unwrap();
+    assert!(
+        out.contains("newsecret42"),
+        "raw secret should still be visible from before the reload: {out:?}"
+    );
+    assert!(
+        out.contains("{{proj/new}}"),
+        "secret added mid-session must get masked once busy output allows a tick: {out:?}"
+    );
+}
+
+/// Regression test for the dead alt-screen detection bug: `?47` and
+/// `?1047` enter/exit sequences were matched against the wrong window
+/// length (an extra trailing ESC byte that's never actually part of the
+/// sequence), so `alt_screen` never flipped for those variants and the
+/// scroll-region-restore-on-exit logic could never fire for them either.
+/// Drives the inner shell through `?47` and `?1049` enter/exit round
+/// trips (both must work — `?1049` was already correct and must not
+/// regress) and asserts the scroll region (`\x1b[1;23r`, 24-row pty) gets
+/// re-asserted after each exit, on top of the one `bar.init` sets at
+/// startup: that only happens if `scan_for_alt_screen` actually detected
+/// the true→false transition.
+#[test]
+fn alt_screen_47_and_1049_both_detected_and_region_restored_on_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut cmd = CommandBuilder::new(cargo_bin("trosty"));
+    cmd.env("TROSTY_CONFIG_DIR", dir.path());
+    cmd.env("TROSTY_DATA_DIR", dir.path());
+    cmd.env("TROSTY_MEMORY_STORE", "1");
+    cmd.env("TROSTY_SEED", "proj/key=supersecret9");
+    cmd.env("TROSTY_SHELL", "/bin/sh");
+    // Round-trip both the short (?47) and long (?1049) alt-screen forms,
+    // with a little breathing room between each so the reader/scan loop
+    // sees them as distinct chunks.
+    cmd.env(
+        "TROSTY_SHELL_ARGS",
+        "-c,printf '\\033[?47h'; sleep 0.1; printf '\\033[?47l'; sleep 0.1; \
+         printf '\\033[?1049h'; sleep 0.1; printf '\\033[?1049l'; sleep 0.1",
+    );
+    let mut child = pty.slave.spawn_command(cmd).unwrap();
+    drop(pty.slave);
+    let mut out = String::new();
+    let mut reader = pty.master.try_clone_reader().unwrap();
+    reader.read_to_string(&mut out).ok();
+    let status = child.wait().unwrap();
+    assert!(status.success(), "session exited nonzero: {out:?}");
+
+    let region_cmd = "\x1b[1;23r";
+    let occurrences = out.matches(region_cmd).count();
+    assert!(
+        occurrences >= 3,
+        "expected the scroll region to be re-asserted after both the ?47 \
+         exit and the ?1049 exit (1 at startup + 2 restores = 3+), got \
+         {occurrences}: {out:?}"
+    );
+}

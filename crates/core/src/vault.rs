@@ -113,10 +113,35 @@ impl KeyringStore {
         Ok(Self { index_path, names })
     }
 
+    /// Write `secrets.toml` atomically: write the new contents to a sibling
+    /// temp file, then `fs::rename` it over the real path. A plain
+    /// `fs::write` truncates the file before writing its new contents, so a
+    /// concurrent reader (the session's hot-reload, stat-polling this same
+    /// path from another process) can observe a half-written or empty file
+    /// that still happens to parse as valid (empty) TOML — silently losing
+    /// every secret from the scrubber until the next edit. `rename` within
+    /// the same directory is atomic on the filesystems we support (POSIX
+    /// same-fs rename, Windows `MoveFileEx` via `fs::rename`), so readers
+    /// only ever see the fully-old or fully-new file, never a partial one.
     fn save_index(&self) -> Result<(), CoreError> {
         let names: Vec<String> = self.names.iter().map(|n| n.to_string()).collect();
         let doc = toml::toml! { names = names };
-        fs::write(&self.index_path, doc.to_string())?;
+        let dir = self.index_path.parent().ok_or_else(|| {
+            CoreError::Keyring(format!(
+                "index path {} has no parent directory",
+                self.index_path.display()
+            ))
+        })?;
+        let tmp_path = dir.join(format!(
+            ".secrets.toml.tmp.{}.{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        fs::write(&tmp_path, doc.to_string())?;
+        fs::rename(&tmp_path, &self.index_path)?;
         Ok(())
     }
 
@@ -210,6 +235,37 @@ mod tests {
         drop(s);
         let s2 = KeyringStore::open(dir.path()).unwrap();
         assert_eq!(s2.list().unwrap().len(), 1);
+    }
+
+    /// Extends the round-trip above to exercise `save_index`'s atomic
+    /// write path directly: several saves in a row (add/add/add) must each
+    /// leave `secrets.toml` fully readable by a fresh `KeyringStore::open`
+    /// (never truncated/partial), and must never leave a stray
+    /// `.secrets.toml.tmp.*` file behind in the config dir.
+    #[test]
+    fn keyring_store_index_atomic_write_leaves_no_tmp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = KeyringStore::open(dir.path()).unwrap();
+        for key in ["a_key", "b_key", "c_key"] {
+            s.index_add(&SecretName::from_str(&format!("proj/{key}")).unwrap())
+                .unwrap();
+        }
+        drop(s);
+
+        let entries: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from("secrets.toml")],
+            "no leftover temp file expected: {entries:?}"
+        );
+
+        let s2 = KeyringStore::open(dir.path()).unwrap();
+        let mut names: Vec<String> = s2.list().unwrap().iter().map(|n| n.to_string()).collect();
+        names.sort();
+        assert_eq!(names, vec!["proj/a_key", "proj/b_key", "proj/c_key"]);
     }
 
     #[test]
