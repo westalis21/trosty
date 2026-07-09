@@ -15,9 +15,8 @@ Your AI (and your screen) only ever see secret **names** — `{{stripe_key}}`.
 Real values live in the OS keychain (macOS Keychain / Windows DPAPI / Linux
 libsecret) and appear only at the moment a command actually runs.
 
-> Status: the PTY session, `add`/`exec`/`import`, and live output masking
-> work today — see **Usage** below. The status line and peek-key shown in
-> earlier mockups are Plan 2b.
+> Status: the PTY session, `add`/`exec`/`import`, live output masking, the
+> status line, and secret peek all work today — see **Usage** below.
 
 - **Paste a real value into an AI chat by accident?** It is masked before the
   prompt leaves your machine (Claude Code hooks integration).
@@ -32,9 +31,15 @@ libsecret) and appear only at the moment a command actually runs.
 ```sh
 trosty add demo/key            # value prompted, stored in the OS keychain
 trosty                         # start a protected shell session (live masking)
+# inside a session: Ctrl+G peeks a secret value for 3s
 trosty exec -- <cmd>           # one-shot: expand {{name}} args, mask output
 trosty import .env --project p # bulk-import into a namespace
 ```
+
+The session's bottom-row status bar shows the lock state, current project,
+and secret count, and updates live — including a visible degradation
+message if a hot-reload of the secret store ever fails — whenever the
+secret source changes on disk.
 
 ## v0.1 scope
 

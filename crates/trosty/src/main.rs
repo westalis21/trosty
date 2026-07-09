@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use trosty_core::{Audit, KeyringStore, MemoryStore, SecretName, SecretStore};
 
@@ -67,11 +67,34 @@ fn data_dir() -> PathBuf {
         .unwrap_or_else(|| dirs::data_dir().expect("data dir").join("trosty"))
 }
 
-/// Build the secret store: an in-memory store (optionally pre-seeded via
-/// `TROSTY_SEED`, tests only) when `TROSTY_MEMORY_STORE` is set, otherwise
-/// the real OS keychain. `TROSTY_SEED` is only honored alongside
-/// `TROSTY_MEMORY_STORE` — never let a stray env var seed the real keychain.
-fn open_store() -> Result<Box<dyn SecretStore>> {
+/// Parse `TROSTY_SEED_FILE` contents (newline-separated `name=value` pairs,
+/// same syntax as `TROSTY_SEED`'s comma-separated pairs) into `store`. Used
+/// both at initial open and again on every hot-reload, so the file is the
+/// live source of truth for the memory-store test double.
+fn load_seed_file(store: &mut MemoryStore, path: &Path) -> Result<()> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("read seed file {}", path.display()))?;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((n, v)) = line.split_once('=') {
+            store.set(&SecretName::from_str(n)?, v)?;
+        }
+    }
+    Ok(())
+}
+
+/// Build the secret store, and the path (if any) whose mtime the session
+/// should watch for hot-reload: an in-memory store (optionally pre-seeded
+/// via `TROSTY_SEED` and/or `TROSTY_SEED_FILE`, tests only) when
+/// `TROSTY_MEMORY_STORE` is set, otherwise the real OS keychain watching its
+/// `secrets.toml` index. `TROSTY_SEED`/`TROSTY_SEED_FILE` are only honored
+/// alongside `TROSTY_MEMORY_STORE` — never let a stray env var seed the real
+/// keychain. Calling this again (as the `reload` closure does) re-reads
+/// whichever source is live, which is exactly what a hot-reload needs.
+fn open_store() -> Result<(Box<dyn SecretStore>, Option<PathBuf>)> {
     if std::env::var_os("TROSTY_MEMORY_STORE").is_some() {
         let mut store = MemoryStore::new();
         if let Ok(seed) = std::env::var("TROSTY_SEED") {
@@ -81,10 +104,19 @@ fn open_store() -> Result<Box<dyn SecretStore>> {
                 }
             }
         }
-        Ok(Box::new(store))
+        let watch = if let Ok(seed_file) = std::env::var("TROSTY_SEED_FILE") {
+            let path = PathBuf::from(seed_file);
+            load_seed_file(&mut store, &path)?;
+            Some(path)
+        } else {
+            None
+        };
+        Ok((Box::new(store), watch))
     } else {
-        Ok(Box::new(
-            KeyringStore::open(&config_dir()).context("open keyring store")?,
+        let watch = config_dir().join("secrets.toml");
+        Ok((
+            Box::new(KeyringStore::open(&config_dir()).context("open keyring store")?),
+            Some(watch),
         ))
     }
 }
@@ -111,14 +143,21 @@ fn placeholder_names(text: &str) -> Vec<String> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let Some(cmd) = cli.command else {
-        let store = open_store()?;
+        let (store, watch) = open_store()?;
         let secrets = collect_secrets(store.as_ref())?; // fail-closed before any child spawns
         let projects = trosty_core::ProjectsFile::open(&config_dir())?;
         let audit = Audit::open(&data_dir());
-        let code = session::run(&secrets, &projects, &audit)?;
+        // Re-opens the store the same way and re-collects — for the memory
+        // store this re-reads TROSTY_SEED_FILE; for the keychain it re-reads
+        // secrets.toml and re-fetches from the OS keychain.
+        let reload = || -> Result<Vec<(SecretName, String)>> {
+            let (store, _watch) = open_store()?;
+            collect_secrets(store.as_ref())
+        };
+        let code = session::run(&secrets, &projects, &audit, watch, reload)?;
         std::process::exit(code);
     };
-    let mut store = open_store()?;
+    let (mut store, _watch) = open_store()?;
     let audit = Audit::open(&data_dir());
 
     match cmd {

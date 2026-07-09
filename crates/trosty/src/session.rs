@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, Child, CommandBuilder, PtySize};
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 use trosty_core::{Audit, ProjectsFile, Scrubber, SecretName};
 
 enum SessionEvent {
@@ -17,6 +19,11 @@ struct StatusBar {
     cols: u16,
     enabled: bool,
     alt_screen: bool,
+    /// Leading "lock" segment of the normal bar text. Normally the locked
+    /// emoji; swapped to a degraded-state message (e.g. after a failed
+    /// hot-reload) so the failure stays visible in the bar itself rather
+    /// than a one-off toast that scrolls away.
+    lock: String,
 }
 
 impl StatusBar {
@@ -26,6 +33,7 @@ impl StatusBar {
             cols,
             enabled,
             alt_screen: false,
+            lock: "🔒".to_string(),
         }
     }
 
@@ -48,16 +56,21 @@ impl StatusBar {
         project: Option<&str>,
         secret_count: usize,
     ) -> Result<()> {
-        if !self.enabled || self.alt_screen {
-            return Ok(());
-        }
-
-        let lock = "🔒";
         let project_name = project.unwrap_or("(none)");
         let text = format!(
             "{} trosty · {} · {} secrets",
-            lock, project_name, secret_count
+            self.lock, project_name, secret_count
         );
+        self.draw_text(out, &text)
+    }
+
+    /// Write arbitrary text to the bar row (used by both the normal bar and
+    /// the transient peek display). No-op when the bar is disabled or the
+    /// child has switched to the alt screen.
+    fn draw_text(&mut self, out: &mut dyn Write, text: &str) -> Result<()> {
+        if !self.enabled || self.alt_screen {
+            return Ok(());
+        }
 
         // Truncate text by characters (not bytes) to fit in the available cols
         let max_chars = (self.cols as usize).saturating_sub(1);
@@ -209,8 +222,11 @@ pub fn run(
     secrets: &[(SecretName, String)],
     projects: &ProjectsFile,
     audit: &Audit,
+    watch: Option<PathBuf>,
+    reload: impl Fn() -> Result<Vec<(SecretName, String)>>,
 ) -> Result<i32> {
-    let scrubber = std::sync::Arc::new(Scrubber::new(secrets));
+    let mut secrets: Vec<(SecretName, String)> = secrets.to_vec();
+    let mut scrubber = Arc::new(Scrubber::new(&secrets));
     let project = std::env::current_dir()
         .ok()
         .and_then(|d| projects.project_for(&d));
@@ -325,6 +341,27 @@ pub fn run(
     }
 
     let mut stream = trosty_core::SwappableStream::new(scrubber.clone());
+
+    // Peek state: cycles through current secret names on each Ctrl+G, shown
+    // on the bar for TROSTY_PEEK_MS (default 3s), then reverts to the normal
+    // bar on the first tick past the deadline.
+    let peek_ms: u64 = std::env::var("TROSTY_PEEK_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3000);
+    let mut peek_index: usize = 0;
+    let mut peek_deadline: Option<Instant> = None;
+
+    // Hot-reload state: poll `watch`'s mtime at most once a second (not on
+    // every 250ms tick), and only act when it actually changed. `last_mtime`
+    // is seeded from the current mtime before the loop starts so the first
+    // tick never fires a spurious reload for a file that hasn't changed yet.
+    let mut last_stat = Instant::now();
+    let mut last_mtime: Option<SystemTime> = watch
+        .as_ref()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok());
+
     loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(SessionEvent::Output(chunk)) => {
@@ -335,8 +372,14 @@ pub fn run(
                     break;
                 }
                 let _ = stdout.flush();
-                // Redraw status bar after output (no-op if alt_screen is true)
-                let _ = bar.draw(&mut stdout, project.as_deref(), secrets.len());
+                // Redraw status bar after output (no-op if alt_screen is
+                // true, or if a peek is currently being shown — don't let
+                // ordinary shell output stomp on the peek before its
+                // deadline).
+                let peek_active = peek_deadline.is_some_and(|d| Instant::now() < d);
+                if !peek_active {
+                    let _ = bar.draw(&mut stdout, project.as_deref(), secrets.len());
+                }
             }
             Ok(SessionEvent::Eof) => break,
             Ok(SessionEvent::Resize) => {
@@ -351,10 +394,63 @@ pub fn run(
                 );
             }
             Ok(SessionEvent::Peek) => {
-                // handled in Plan 2b Task 4
+                if secrets.is_empty() {
+                    let _ = bar.draw_text(&mut stdout, "👁 no secrets");
+                } else {
+                    let idx = peek_index % secrets.len();
+                    let (name, value) = &secrets[idx];
+                    let text = format!("👁 {name} = {value}");
+                    let _ = bar.draw_text(&mut stdout, &text);
+                    audit.log("peek", &name.to_string());
+                    peek_index = idx + 1;
+                }
+                peek_deadline = Some(Instant::now() + Duration::from_millis(peek_ms));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // tick point for later tasks
+                let now = Instant::now();
+                // Peek expiry: redraw the normal bar the first tick past
+                // the deadline.
+                if let Some(deadline) = peek_deadline {
+                    if now >= deadline {
+                        peek_deadline = None;
+                        let _ = bar.draw(&mut stdout, project.as_deref(), secrets.len());
+                    }
+                }
+                // Hot-reload: stat at most once a second, and only reload
+                // when the mtime actually moved.
+                if now.duration_since(last_stat) >= Duration::from_secs(1) {
+                    last_stat = now;
+                    if let Some(path) = &watch {
+                        if let Ok(mtime) = std::fs::metadata(path).and_then(|m| m.modified()) {
+                            if last_mtime != Some(mtime) {
+                                last_mtime = Some(mtime);
+                                match reload() {
+                                    Ok(new_secrets) => {
+                                        secrets = new_secrets;
+                                        scrubber = Arc::new(Scrubber::new(&secrets));
+                                        stream.set_scrubber(scrubber.clone());
+                                        bar.lock = "🔒".to_string();
+                                        let _ = bar.draw(
+                                            &mut stdout,
+                                            project.as_deref(),
+                                            secrets.len(),
+                                        );
+                                        audit.log("reload_ok", &secrets.len().to_string());
+                                    }
+                                    Err(_) => {
+                                        bar.lock = "🔓 reload failed".to_string();
+                                        let _ = bar.draw(
+                                            &mut stdout,
+                                            project.as_deref(),
+                                            secrets.len(),
+                                        );
+                                        audit.log("reload_failed", "-");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
