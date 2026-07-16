@@ -86,6 +86,52 @@ fn post_tool_use(v: &Value, store: &dyn SecretStore, audit: &Audit) -> String {
     .to_string()
 }
 
+use trosty_core::expand;
+
+/// PreToolUse: expand `{{name}}` placeholders in a Bash command into real
+/// values before it runs. Non-Bash or no placeholder → passthrough. Unknown
+/// placeholder or locked vault → deny (fail-closed, command never runs).
+fn pre_tool_use(v: &Value, store: &dyn SecretStore, audit: &Audit) -> String {
+    if v.get("tool_name").and_then(Value::as_str) != Some("Bash") {
+        return "{}".to_string();
+    }
+    let command = v
+        .get("tool_input")
+        .and_then(|ti| ti.get("command"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !command.contains("{{") {
+        return "{}".to_string(); // nothing to expand, leave the call untouched
+    }
+    let secrets = match load_secrets(store) {
+        Ok(s) => s,
+        Err(_) => return deny("trosty: vault locked — command blocked"),
+    };
+    let scoped = scoped_store(&secrets);
+    match expand(command, &scoped) {
+        Ok(expanded) => {
+            audit.log("hook_expand", "PreToolUse");
+            let mut ti = v.get("tool_input").cloned().unwrap_or_else(|| json!({}));
+            ti["command"] = json!(expanded);
+            json!({"hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "updatedInput": ti
+            }})
+            .to_string()
+        }
+        Err(_) => deny("trosty: unknown secret placeholder in command"),
+    }
+}
+
+fn deny(reason: &str) -> String {
+    json!({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": reason
+    }})
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +234,42 @@ mod tests {
             out["hookSpecificOutput"]["updatedToolOutput"],
             "trosty: vault locked — output suppressed"
         );
+    }
+
+    #[test]
+    fn pre_no_placeholder_is_passthrough() {
+        let (_d, audit) = audit_tmp();
+        let v = json!({"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                       "tool_input": {"command": "ls -la"}});
+        assert_eq!(super::pre_tool_use(&v, &store_one(), &audit), "{}");
+    }
+
+    #[test] // [GO-only]
+    fn pre_expands_known_placeholder() {
+        let (_d, audit) = audit_tmp();
+        let v = json!({"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                       "tool_input": {"command": "curl -H \"auth: {{demo/token}}\""}});
+        let out: Value = serde_json::from_str(&super::pre_tool_use(&v, &store_one(), &audit)).unwrap();
+        assert_eq!(
+            out["hookSpecificOutput"]["updatedInput"]["command"],
+            "curl -H \"auth: s3cretVALUE\""
+        );
+    }
+
+    #[test]
+    fn pre_denies_unknown_placeholder() {
+        let (_d, audit) = audit_tmp();
+        let v = json!({"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                       "tool_input": {"command": "echo {{demo/missing}}"}});
+        let out: Value = serde_json::from_str(&super::pre_tool_use(&v, &store_one(), &audit)).unwrap();
+        assert_eq!(out["hookSpecificOutput"]["permissionDecision"], "deny");
+    }
+
+    #[test]
+    fn pre_non_bash_is_passthrough() {
+        let (_d, audit) = audit_tmp();
+        let v = json!({"hook_event_name": "PreToolUse", "tool_name": "Read",
+                       "tool_input": {"file_path": "x"}});
+        assert_eq!(super::pre_tool_use(&v, &store_one(), &audit), "{}");
     }
 }
