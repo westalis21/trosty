@@ -49,6 +49,43 @@ fn scoped_store(secrets: &[(SecretName, String)]) -> MemoryStore {
     store
 }
 
+use trosty_core::Audit;
+
+/// PostToolUse: mask secret values in a Bash tool's output before the model
+/// reads it. Non-Bash → passthrough. Locked/unreadable secrets → suppress the
+/// entire output (fail-closed: better to drop useful text than risk a leak).
+fn post_tool_use(v: &Value, store: &dyn SecretStore, audit: &Audit) -> String {
+    if v.get("tool_name").and_then(Value::as_str) != Some("Bash") {
+        return "{}".to_string();
+    }
+    let secrets = match load_secrets(store) {
+        Ok(s) => s,
+        Err(_) => {
+            audit.log("hook_locked", "PostToolUse");
+            return json!({"hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "updatedToolOutput": "trosty: vault locked — output suppressed"
+            }})
+            .to_string();
+        }
+    };
+    let scr = Scrubber::new(&secrets);
+    // Accept either the object form (`tool_response`) or a bare string
+    // (`tool_output`) — whichever this Claude Code build sends (see Task 1).
+    let response = v
+        .get("tool_response")
+        .or_else(|| v.get("tool_output"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let masked = deep_scrub(&response, &scr);
+    audit.log("hook_mask", "PostToolUse");
+    json!({"hookSpecificOutput": {
+        "hookEventName": "PostToolUse",
+        "updatedToolOutput": masked
+    }})
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,6 +130,63 @@ mod tests {
         assert_eq!(
             store.get(&SecretName::from_str("a/one").unwrap()).unwrap().as_deref(),
             Some("valueone")
+        );
+    }
+
+    use trosty_core::Audit;
+
+    fn audit_tmp() -> (tempfile::TempDir, Audit) {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Audit::open(dir.path());
+        (dir, a)
+    }
+
+    fn store_one() -> MemoryStore {
+        let mut s = MemoryStore::new();
+        s.set(&SecretName::from_str("demo/token").unwrap(), "s3cretVALUE").unwrap();
+        s
+    }
+
+    #[test]
+    fn post_masks_bash_output() {
+        let (_d, audit) = audit_tmp();
+        let v = json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_response": {"stdout": "KEY=s3cretVALUE", "stderr": ""}
+        });
+        let out: Value = serde_json::from_str(&super::post_tool_use(&v, &store_one(), &audit)).unwrap();
+        assert_eq!(out["hookSpecificOutput"]["updatedToolOutput"]["stdout"], "KEY={{demo/token}}");
+    }
+
+    #[test]
+    fn post_non_bash_is_passthrough() {
+        let (_d, audit) = audit_tmp();
+        let v = json!({"hook_event_name": "PostToolUse", "tool_name": "Read", "tool_response": "x"});
+        assert_eq!(super::post_tool_use(&v, &store_one(), &audit), "{}");
+    }
+
+    #[test]
+    fn post_suppresses_when_secrets_unreadable() {
+        let (_d, audit) = audit_tmp();
+        // FailingStore simulates a locked keychain: list() ok, get() errors.
+        struct FailingStore;
+        impl SecretStore for FailingStore {
+            fn set(&mut self, _: &SecretName, _: &str) -> Result<(), CoreError> { Ok(()) }
+            fn get(&self, _: &SecretName) -> Result<Option<String>, CoreError> {
+                Err(CoreError::Keyring("locked".into()))
+            }
+            fn delete(&mut self, _: &SecretName) -> Result<(), CoreError> { Ok(()) }
+            fn list(&self) -> Result<Vec<SecretName>, CoreError> {
+                Ok(vec![SecretName::from_str("demo/token").unwrap()])
+            }
+        }
+        let v = json!({"hook_event_name": "PostToolUse", "tool_name": "Bash",
+                       "tool_response": {"stdout": "KEY=s3cretVALUE"}});
+        let out: Value = serde_json::from_str(&super::post_tool_use(&v, &FailingStore, &audit)).unwrap();
+        assert_eq!(
+            out["hookSpecificOutput"]["updatedToolOutput"],
+            "trosty: vault locked — output suppressed"
         );
     }
 }
