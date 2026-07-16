@@ -162,6 +162,33 @@ fn block(reason: &str) -> String {
     json!({"decision": "block", "reason": reason}).to_string()
 }
 
+/// Parse a hook event JSON and route it to the matching handler. Unknown or
+/// unparseable input is a safe no-op (`"{}"`, exit 0) — Claude Code treats an
+/// empty object as "no decision", so non-target events pass through untouched.
+pub fn dispatch(input: &str, store: &dyn SecretStore, audit: &Audit) -> String {
+    let Ok(v) = serde_json::from_str::<Value>(input) else {
+        return "{}".to_string();
+    };
+    match event_name(&v) {
+        Some("PreToolUse") => pre_tool_use(&v, store, audit),
+        Some("PostToolUse") => post_tool_use(&v, store, audit),
+        Some("UserPromptSubmit") => user_prompt_submit(&v, store, audit),
+        _ => "{}".to_string(),
+    }
+}
+
+// TODO(Task 8): replace stub — real implementation merges trosty's three
+// hooks into ~/.claude/settings.json (idempotent).
+pub fn install(_p: &std::path::Path) -> anyhow::Result<()> {
+    unimplemented!()
+}
+
+// TODO(Task 8): replace stub — real implementation removes trosty's hooks
+// from ~/.claude/settings.json.
+pub fn uninstall(_p: &std::path::Path) -> anyhow::Result<()> {
+    unimplemented!()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,5 +364,20 @@ mod tests {
         let v = json!({"hook_event_name": "UserPromptSubmit", "prompt": "hello"});
         let out: Value = serde_json::from_str(&super::user_prompt_submit(&v, &FailingStore, &audit)).unwrap();
         assert_eq!(out["decision"], "block");
+    }
+
+    #[test]
+    fn dispatch_routes_by_event_name() {
+        let (_d, audit) = audit_tmp();
+        let v = r#"{"hook_event_name":"PostToolUse","tool_name":"Bash","tool_response":{"stdout":"s3cretVALUE"}}"#;
+        let out: Value = serde_json::from_str(&super::dispatch(v, &store_one(), &audit)).unwrap();
+        assert_eq!(out["hookSpecificOutput"]["updatedToolOutput"]["stdout"], "{{demo/token}}");
+    }
+
+    #[test]
+    fn dispatch_unknown_event_is_noop() {
+        let (_d, audit) = audit_tmp();
+        assert_eq!(super::dispatch(r#"{"hook_event_name":"SessionStart"}"#, &store_one(), &audit), "{}");
+        assert_eq!(super::dispatch("not json", &store_one(), &audit), "{}");
     }
 }

@@ -39,12 +39,37 @@ enum Cmd {
         #[arg(trailing_var_arg = true, required = true)]
         cmd: Vec<String>,
     },
+    /// Run as a Claude Code hook (reads event JSON on stdin), or manage the
+    /// hook install in ~/.claude/settings.json.
+    Hook {
+        #[command(subcommand)]
+        action: Option<HookAction>,
+    },
+}
+
+#[derive(Subcommand)]
+enum HookAction {
+    /// Write the three trosty hooks into ~/.claude/settings.json (idempotent)
+    Install,
+    /// Remove trosty's hooks from ~/.claude/settings.json
+    Uninstall,
 }
 
 fn config_dir() -> PathBuf {
     std::env::var_os("TROSTY_CONFIG_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| dirs::config_dir().expect("config dir").join("trosty"))
+}
+
+fn claude_settings_path() -> PathBuf {
+    std::env::var_os("TROSTY_CLAUDE_SETTINGS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .expect("home dir")
+                .join(".claude")
+                .join("settings.json")
+        })
 }
 
 /// Read every secret currently in the store's index, failing closed if any
@@ -271,6 +296,17 @@ fn main() -> Result<()> {
             let status = child.wait()?;
             std::process::exit(status.code().unwrap_or(1));
         }
+        Cmd::Hook { action } => match action {
+            None => {
+                use std::io::Read;
+                let mut input = String::new();
+                std::io::stdin().read_to_string(&mut input)?;
+                let out = hook::dispatch(&input, store.as_ref(), &audit);
+                println!("{out}");
+            }
+            Some(HookAction::Install) => hook::install(&claude_settings_path())?,
+            Some(HookAction::Uninstall) => hook::uninstall(&claude_settings_path())?,
+        },
     }
     Ok(())
 }
