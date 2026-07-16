@@ -132,6 +132,36 @@ fn deny(reason: &str) -> String {
     .to_string()
 }
 
+/// UserPromptSubmit: block a prompt that contains a raw secret value (the
+/// hooks API can't rewrite a prompt — only block or add context). Locked vault
+/// → block (can't prove the prompt is clean). Clean → allow.
+fn user_prompt_submit(v: &Value, store: &dyn SecretStore, audit: &Audit) -> String {
+    let prompt = v
+        .get("prompt")
+        .or_else(|| v.get("user_prompt"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let secrets = match load_secrets(store) {
+        Ok(s) => s,
+        Err(_) => {
+            audit.log("hook_block", "UserPromptSubmit");
+            return block("trosty: vault locked — unlock to submit prompts");
+        }
+    };
+    let scr = Scrubber::new(&secrets);
+    if scr.scrub(prompt) != prompt {
+        audit.log("hook_block", "UserPromptSubmit");
+        return block(
+            "trosty: a raw secret value is in your prompt — use its {{name}} placeholder instead",
+        );
+    }
+    "{}".to_string()
+}
+
+fn block(reason: &str) -> String {
+    json!({"decision": "block", "reason": reason}).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,5 +301,41 @@ mod tests {
         let v = json!({"hook_event_name": "PreToolUse", "tool_name": "Read",
                        "tool_input": {"file_path": "x"}});
         assert_eq!(super::pre_tool_use(&v, &store_one(), &audit), "{}");
+    }
+
+    #[test]
+    fn prompt_allows_clean_text() {
+        let (_d, audit) = audit_tmp();
+        let v = json!({"hook_event_name": "UserPromptSubmit", "prompt": "deploy the app please"});
+        assert_eq!(super::user_prompt_submit(&v, &store_one(), &audit), "{}");
+    }
+
+    #[test]
+    fn prompt_blocks_raw_secret() {
+        let (_d, audit) = audit_tmp();
+        let v = json!({"hook_event_name": "UserPromptSubmit",
+                       "prompt": "use key s3cretVALUE to log in"});
+        let out: Value = serde_json::from_str(&super::user_prompt_submit(&v, &store_one(), &audit)).unwrap();
+        assert_eq!(out["decision"], "block");
+        assert!(out["reason"].as_str().unwrap().contains("{{name}}"));
+    }
+
+    #[test]
+    fn prompt_blocks_when_vault_locked() {
+        let (_d, audit) = audit_tmp();
+        struct FailingStore;
+        impl SecretStore for FailingStore {
+            fn set(&mut self, _: &SecretName, _: &str) -> Result<(), CoreError> { Ok(()) }
+            fn get(&self, _: &SecretName) -> Result<Option<String>, CoreError> {
+                Err(CoreError::Keyring("locked".into()))
+            }
+            fn delete(&mut self, _: &SecretName) -> Result<(), CoreError> { Ok(()) }
+            fn list(&self) -> Result<Vec<SecretName>, CoreError> {
+                Ok(vec![SecretName::from_str("demo/token").unwrap()])
+            }
+        }
+        let v = json!({"hook_event_name": "UserPromptSubmit", "prompt": "hello"});
+        let out: Value = serde_json::from_str(&super::user_prompt_submit(&v, &FailingStore, &audit)).unwrap();
+        assert_eq!(out["decision"], "block");
     }
 }
