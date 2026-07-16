@@ -5,6 +5,7 @@ use std::str::FromStr;
 use trosty_core::{Audit, KeyringStore, MemoryStore, SecretName, SecretStore};
 
 mod session;
+mod hook;
 
 #[derive(Parser)]
 #[command(
