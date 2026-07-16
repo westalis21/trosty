@@ -33,16 +33,32 @@ correct result, never to a leak.
 - `UserPromptSubmit` → **cannot** rewrite the prompt; only `decision:
   "block"` + `reason` or `hookSpecificOutput.additionalContext`. ✅ guard-only.
 
-## PreToolUse expansion — reflection check (PENDING live E2E)
+## PreToolUse expansion — reflection check (CONFIRMED via live E2E 2026-07-16)
 
 **Question:** when the hook returns `updatedInput` with `{{name}}` expanded to
 the real value, does that expanded value become visible to the model (in its
 context or in `transcript_path`)? If yes, expansion would leak — defeating its
 purpose.
 
-**Current decision:** `EXPAND: GO` (Task 5 implements expansion). Rationale:
-`updatedInput` is an execution-time substitution; the assistant's own message
-retains the `{{name}}` placeholder it authored. **Must be confirmed** in the
-manual E2E (plan Task 9, step 8). If the live run shows the expanded value
-reflected back, switch Task 5 to guard-only per the plan's NO-GO note (deny
-unknown/locked, no expansion) — PostToolUse masking is unaffected either way.
+**Result: `EXPAND: GO` — CONFIRMED.** Live E2E run (`trosty hook install` into
+a scratch settings file + real Claude Code session). Findings from the session
+transcript:
+
+- The assistant's `tool_use` (the command it authored) and the `tool_result`
+  contain **only the `{{name}}` placeholder** — the model never receives the
+  expanded value. The model's own summary echoed `{{demo/token}}`.
+- The expanded real value appears **only** in a transcript-only diagnostic
+  entry `type: "attachment"` / `"hook_success"` (fields: `hookName`, `stdout`,
+  `exitCode`, `durationMs`). Its model-injected `content` field is **empty**;
+  the raw value sits in `stdout`, which Claude Code logs for observability and
+  does **not** feed back into model context.
+- A second occurrence in an unrelated session's transcript was the finding
+  value being typed into guidance text — not a trosty path.
+
+**Residual note (accepted, not a model/API leak):** because `updatedInput`
+must carry the real command for expansion to work, the expanded value is
+written to the **local** Claude Code transcript file (`hook_success.stdout`
+diagnostic record) in plaintext. This is a local-disk footprint on the same
+machine, alongside the legitimately-written command output — never sent to the
+LLM. Only the guard-only variant (no expansion) avoids it, at the cost of the
+feature. Kept as expansion (GO).
