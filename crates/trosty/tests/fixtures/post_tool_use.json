@@ -1,0 +1,16 @@
+{
+  "session_id": "demo-session",
+  "transcript_path": "/tmp/demo-transcript.jsonl",
+  "cwd": "/home/user/project",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "cat .env"
+  },
+  "tool_response": {
+    "stdout": "STRIPE_KEY=s3cretVALUE\n",
+    "stderr": "",
+    "interrupted": false,
+    "isImage": false
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "session_id": "demo-session",
+  "transcript_path": "/tmp/demo-transcript.jsonl",
+  "cwd": "/home/user/project",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "curl -H \"authorization: Bearer {{demo/token}}\" https://api.example.com",
+    "description": "call the API"
+  }
+}
