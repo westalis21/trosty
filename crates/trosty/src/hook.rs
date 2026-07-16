@@ -14,6 +14,12 @@ pub fn event_name(v: &Value) -> Option<&str> {
 /// Recursively replace secret values with `{{name}}` in every string inside a
 /// JSON value, preserving the value's shape. Works whether a tool result is a
 /// bare string or a structured object (e.g. Bash `{stdout, stderr}`).
+///
+/// Only `Value::String` nodes are scrubbed — numbers and bools pass through
+/// unexamined. That's safe here: secret values are always strings (never
+/// bare numbers/bools), and the only inputs this runs against are Bash's
+/// `stdout`/`stderr`, which JSON-encode as strings too. A secret could never
+/// appear as, say, a bare JSON number for this to miss.
 pub fn deep_scrub(v: &Value, scr: &Scrubber) -> Value {
     match v {
         Value::String(s) => Value::String(scr.scrub(s)),
@@ -164,6 +170,27 @@ fn block(reason: &str) -> String {
     json!({"decision": "block", "reason": reason}).to_string()
 }
 
+/// Fail-closed decision JSON for when trosty's own internals fail — e.g. the
+/// secret store can't be opened — before any event-specific handler ever
+/// runs. `event` is whatever `hook_event_name` was (if the input parsed at
+/// all); this mirrors the exact shape each handler already emits when the
+/// vault is locked, so Claude Code and the model see an identical decision
+/// whether the store failed to open or merely failed to read. Unknown/other
+/// events (including unparseable input) are a safe no-op (`"{}"`, exit 0),
+/// matching `dispatch`'s passthrough for non-target events.
+pub fn fail_closed_for(event: Option<&str>) -> String {
+    match event {
+        Some("PreToolUse") => deny("trosty: vault locked — command blocked"),
+        Some("PostToolUse") => json!({"hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "updatedToolOutput": "trosty: vault locked — output suppressed"
+        }})
+        .to_string(),
+        Some("UserPromptSubmit") => block("trosty: vault locked — unlock to submit prompts"),
+        _ => "{}".to_string(),
+    }
+}
+
 /// Parse a hook event JSON and route it to the matching handler. Unknown or
 /// unparseable input is a safe no-op (`"{}"`, exit 0) — Claude Code treats an
 /// empty object as "no decision", so non-target events pass through untouched.
@@ -203,15 +230,25 @@ fn write_settings(path: &Path, v: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether `entry`'s command is trosty's own hook invocation — exactly
+/// `trosty hook`, or a path to a binary literally named `trosty` followed by
+/// ` hook` (unix `/trosty hook`, windows `\trosty hook`). Deliberately
+/// narrower than a `contains("trosty")` substring match: that used to catch
+/// unrelated hooks too (e.g. a user's `~/scripts/run-trosty-backup hook`),
+/// silently dropping them on install/uninstall. A trosty binary renamed away
+/// from `trosty` won't match — accepted, documented limitation.
 fn is_trosty_entry(entry: &Value) -> bool {
     entry
         .get("hooks")
         .and_then(Value::as_array)
         .is_some_and(|hs| {
             hs.iter().any(|h| {
-                h.get("command")
-                    .and_then(Value::as_str)
-                    .is_some_and(|c| c.contains("trosty") && c.trim_end().ends_with("hook"))
+                h.get("command").and_then(Value::as_str).is_some_and(|c| {
+                    let c = c.trim();
+                    c == "trosty hook"
+                        || c.ends_with("/trosty hook")
+                        || c.ends_with("\\trosty hook")
+                })
             })
         })
 }
@@ -231,7 +268,11 @@ pub fn install(settings_path: &Path) -> anyhow::Result<()> {
             .unwrap()
             .entry(event.to_string())
             .or_insert_with(|| json!([]));
-        let list = arr.as_array_mut().expect("event maps to an array");
+        let list = arr.as_array_mut().ok_or_else(|| {
+            anyhow::anyhow!(
+                "settings.json: hooks.{event} is not an array (expected a list of hook entries) — fix or remove it before running install"
+            )
+        })?;
         list.retain(|e| !is_trosty_entry(e)); // drop our old entry → idempotent
         let hook_obj = json!({"type": "command", "command": command});
         let entry = if tool_matched {
@@ -268,7 +309,12 @@ pub fn uninstall(settings_path: &Path) -> anyhow::Result<()> {
     let mut settings = read_settings(settings_path)?;
     if let Some(hooks) = settings.get_mut("hooks").and_then(Value::as_object_mut) {
         for (event, _) in EVENTS {
-            if let Some(list) = hooks.get_mut(event).and_then(Value::as_array_mut) {
+            if let Some(v) = hooks.get_mut(event) {
+                let list = v.as_array_mut().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "settings.json: hooks.{event} is not an array (expected a list of hook entries) — fix or remove it before running uninstall"
+                    )
+                })?;
                 list.retain(|e| !is_trosty_entry(e));
             }
         }
@@ -505,6 +551,73 @@ mod tests {
             "{}"
         );
         assert_eq!(super::dispatch("not json", &store_one(), &audit), "{}");
+    }
+
+    #[test]
+    fn fail_closed_for_covers_each_event_and_unknown() {
+        let pre: Value = serde_json::from_str(&super::fail_closed_for(Some("PreToolUse"))).unwrap();
+        assert_eq!(pre["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert_eq!(
+            pre["hookSpecificOutput"]["permissionDecisionReason"],
+            "trosty: vault locked — command blocked"
+        );
+
+        let post: Value =
+            serde_json::from_str(&super::fail_closed_for(Some("PostToolUse"))).unwrap();
+        assert_eq!(
+            post["hookSpecificOutput"]["updatedToolOutput"],
+            "trosty: vault locked — output suppressed"
+        );
+
+        let prompt: Value =
+            serde_json::from_str(&super::fail_closed_for(Some("UserPromptSubmit"))).unwrap();
+        assert_eq!(prompt["decision"], "block");
+        assert_eq!(
+            prompt["reason"],
+            "trosty: vault locked — unlock to submit prompts"
+        );
+
+        assert_eq!(super::fail_closed_for(Some("SessionStart")), "{}");
+        assert_eq!(super::fail_closed_for(None), "{}");
+    }
+
+    #[test]
+    fn foreign_lookalike_hook_is_not_matched() {
+        let entry = json!({"hooks": [{"type": "command", "command": "/home/u/scripts/run-trosty-backup hook"}]});
+        assert!(!super::is_trosty_entry(&entry));
+        let entry = json!({"hooks": [{"type": "command", "command": "mytrosty hook"}]});
+        assert!(!super::is_trosty_entry(&entry));
+        // still matches the real binary, any directory, either separator
+        assert!(super::is_trosty_entry(
+            &json!({"hooks": [{"type": "command", "command": "trosty hook"}]})
+        ));
+        assert!(super::is_trosty_entry(
+            &json!({"hooks": [{"type": "command", "command": "/usr/local/bin/trosty hook"}]})
+        ));
+        assert!(super::is_trosty_entry(
+            &json!({"hooks": [{"type": "command", "command": "C:\\tools\\trosty hook"}]})
+        ));
+    }
+
+    #[test]
+    fn foreign_trosty_like_hook_survives_install_and_uninstall() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        std::fs::write(&p, r#"{"hooks":{"PostToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/home/u/scripts/run-trosty-backup hook"}]}]}}"#).unwrap();
+
+        super::install(&p).unwrap();
+        let after: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        let post = after["hooks"]["PostToolUse"].as_array().unwrap();
+        assert!(post
+            .iter()
+            .any(|e| e["hooks"][0]["command"] == "/home/u/scripts/run-trosty-backup hook"));
+
+        super::uninstall(&p).unwrap();
+        let after2: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        let post2 = after2["hooks"]["PostToolUse"].as_array().unwrap();
+        assert!(post2
+            .iter()
+            .any(|e| e["hooks"][0]["command"] == "/home/u/scripts/run-trosty-backup hook"));
     }
 
     #[test]

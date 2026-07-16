@@ -183,6 +183,34 @@ fn main() -> Result<()> {
         let code = session::run(&secrets, &projects, &audit, watch, reload)?;
         std::process::exit(code);
     };
+
+    // `trosty hook` (no subcommand) is Claude Code's dispatch entrypoint: it
+    // must NEVER exit non-zero and must NEVER fail open. Handle it before the
+    // generic `open_store()?` below, which would otherwise bubble a locked/
+    // unreachable keychain out of `main` as a non-zero exit with no decision
+    // JSON — Claude Code treats that as a non-blocking hook error and the
+    // model then sees the raw, unmasked/unexpanded tool output.
+    if let Cmd::Hook { action: None } = cmd {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        let _ = std::io::stdin().read_to_end(&mut bytes); // never `?`: a read failure still needs a decision
+        let input = String::from_utf8_lossy(&bytes).into_owned();
+        // Parse the event name first so a store-open failure can still emit
+        // the event-appropriate fail-closed shape.
+        let event = serde_json::from_str::<serde_json::Value>(&input)
+            .ok()
+            .and_then(|v| hook::event_name(&v).map(str::to_string));
+        let out = match open_store() {
+            Ok((store, _watch)) => {
+                let audit = Audit::open(&data_dir());
+                hook::dispatch(&input, store.as_ref(), &audit)
+            }
+            Err(_) => hook::fail_closed_for(event.as_deref()),
+        };
+        println!("{out}");
+        return Ok(());
+    }
+
     let (mut store, _watch) = open_store()?;
     let audit = Audit::open(&data_dir());
 
@@ -307,13 +335,8 @@ fn main() -> Result<()> {
             std::process::exit(status.code().unwrap_or(1));
         }
         Cmd::Hook { action } => match action {
-            None => {
-                use std::io::Read;
-                let mut input = String::new();
-                std::io::stdin().read_to_string(&mut input)?;
-                let out = hook::dispatch(&input, store.as_ref(), &audit);
-                println!("{out}");
-            }
+            // Handled above (fail-closed dispatch path) before `open_store()?`.
+            None => unreachable!("Cmd::Hook with action None is handled before open_store()?"),
             Some(HookAction::Install) => hook::install(&claude_settings_path())?,
             Some(HookAction::Uninstall) => hook::uninstall(&claude_settings_path())?,
         },

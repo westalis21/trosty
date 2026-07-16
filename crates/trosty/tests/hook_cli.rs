@@ -23,6 +23,48 @@ fn hook_masks_bash_output_over_stdin() {
 }
 
 #[test]
+fn hook_expands_bash_command_over_stdin() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"curl -H auth: {{demo/token}}"}}"#;
+    let mut cmd = Command::cargo_bin("trosty").unwrap();
+    let assert = cmd
+        .env("TROSTY_CONFIG_DIR", dir.path())
+        .env("TROSTY_DATA_DIR", dir.path())
+        .env("TROSTY_MEMORY_STORE", "1")
+        .env("TROSTY_SEED", "demo/token=s3cretVALUE")
+        .arg("hook")
+        .write_stdin(input)
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    let command = v["hookSpecificOutput"]["updatedInput"]["command"]
+        .as_str()
+        .unwrap();
+    assert!(command.contains("s3cretVALUE"), "got: {out}");
+}
+
+#[test]
+fn hook_blocks_raw_secret_prompt_over_stdin() {
+    let dir = tempfile::tempdir().unwrap();
+    let input =
+        r#"{"hook_event_name":"UserPromptSubmit","prompt":"use key s3cretVALUE to log in"}"#;
+    let mut cmd = Command::cargo_bin("trosty").unwrap();
+    let assert = cmd
+        .env("TROSTY_CONFIG_DIR", dir.path())
+        .env("TROSTY_DATA_DIR", dir.path())
+        .env("TROSTY_MEMORY_STORE", "1")
+        .env("TROSTY_SEED", "demo/token=s3cretVALUE")
+        .arg("hook")
+        .write_stdin(input)
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["decision"], "block", "got: {out}");
+}
+
+#[test]
 fn install_then_uninstall_preserves_foreign_hooks() {
     let dir = tempfile::tempdir().unwrap();
     let settings = dir.path().join("settings.json");
