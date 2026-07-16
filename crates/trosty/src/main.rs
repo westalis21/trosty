@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use trosty_core::{Audit, KeyringStore, MemoryStore, SecretName, SecretStore};
 
-mod session;
 mod hook;
+mod session;
 
 #[derive(Parser)]
 #[command(
@@ -218,6 +218,16 @@ fn main() -> Result<()> {
             println!("data dir:   {}", data_dir().display());
             println!("secrets in index: {}", store.list()?.len());
             println!("keychain: reachable");
+            let events = hook::installed_events(&claude_settings_path());
+            println!(
+                "claude hooks: {}/3 installed ({})",
+                events.len(),
+                if events.is_empty() {
+                    "-".to_string()
+                } else {
+                    events.join(", ")
+                }
+            );
             println!("ok");
         }
         Cmd::Import { file, project } => {

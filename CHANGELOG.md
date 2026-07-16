@@ -14,3 +14,6 @@
   standard encodings (base64/hex/percent); an arbitrary transformation
   of a value — e.g. a custom cipher or bespoke encoding the attacker
   controls — is not caught. Only known-value matching is in scope.
+- Claude Code hooks adapter (`trosty hook` / `hook install` / `hook uninstall`):
+  PostToolUse masks Bash output, PreToolUse expands `{{name}}`, UserPromptSubmit
+  blocks raw secrets. Fail-closed throughout. `doctor` reports hook status.

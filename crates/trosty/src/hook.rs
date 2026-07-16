@@ -18,9 +18,11 @@ pub fn deep_scrub(v: &Value, scr: &Scrubber) -> Value {
     match v {
         Value::String(s) => Value::String(scr.scrub(s)),
         Value::Array(a) => Value::Array(a.iter().map(|x| deep_scrub(x, scr)).collect()),
-        Value::Object(o) => {
-            Value::Object(o.iter().map(|(k, x)| (k.clone(), deep_scrub(x, scr))).collect())
-        }
+        Value::Object(o) => Value::Object(
+            o.iter()
+                .map(|(k, x)| (k.clone(), deep_scrub(x, scr)))
+                .collect(),
+        ),
         other => other.clone(),
     }
 }
@@ -180,7 +182,7 @@ pub fn dispatch(input: &str, store: &dyn SecretStore, audit: &Audit) -> String {
 use std::path::Path;
 
 const EVENTS: [(&str, bool); 3] = [
-    ("PreToolUse", true),        // true = tool-matched on "Bash"
+    ("PreToolUse", true), // true = tool-matched on "Bash"
     ("PostToolUse", true),
     ("UserPromptSubmit", false), // not tool-scoped
 ];
@@ -202,13 +204,16 @@ fn write_settings(path: &Path, v: &Value) -> anyhow::Result<()> {
 }
 
 fn is_trosty_entry(entry: &Value) -> bool {
-    entry.get("hooks").and_then(Value::as_array).is_some_and(|hs| {
-        hs.iter().any(|h| {
-            h.get("command")
-                .and_then(Value::as_str)
-                .is_some_and(|c| c.contains("trosty") && c.trim_end().ends_with("hook"))
+    entry
+        .get("hooks")
+        .and_then(Value::as_array)
+        .is_some_and(|hs| {
+            hs.iter().any(|h| {
+                h.get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(|c| c.contains("trosty") && c.trim_end().ends_with("hook"))
+            })
         })
-    })
 }
 
 /// Write the three trosty hooks into `settings_path`, preserving any existing
@@ -240,6 +245,22 @@ pub fn install(settings_path: &Path) -> anyhow::Result<()> {
     println!("installed trosty hooks → {}", settings_path.display());
     println!("tip: install a stable binary (`cargo install --path crates/trosty`) so macOS keychain 'Always Allow' sticks across rebuilds");
     Ok(())
+}
+
+/// Which of the three hook events currently have a trosty entry installed.
+pub fn installed_events(settings_path: &Path) -> Vec<String> {
+    let Ok(settings) = read_settings(settings_path) else {
+        return Vec::new();
+    };
+    EVENTS
+        .iter()
+        .filter(|(event, _)| {
+            settings["hooks"][event]
+                .as_array()
+                .is_some_and(|arr| arr.iter().any(is_trosty_entry))
+        })
+        .map(|(event, _)| event.to_string())
+        .collect()
 }
 
 /// Remove only trosty's hook entries, leaving foreign hooks intact.
@@ -288,18 +309,26 @@ mod tests {
     #[test]
     fn load_secrets_reads_all() {
         let mut s = MemoryStore::new();
-        s.set(&SecretName::from_str("a/one").unwrap(), "valueone").unwrap();
-        s.set(&SecretName::from_str("b/two").unwrap(), "valuetwo").unwrap();
+        s.set(&SecretName::from_str("a/one").unwrap(), "valueone")
+            .unwrap();
+        s.set(&SecretName::from_str("b/two").unwrap(), "valuetwo")
+            .unwrap();
         let loaded = super::load_secrets(&s).unwrap();
         assert_eq!(loaded.len(), 2);
     }
 
     #[test]
     fn scoped_store_roundtrips_for_expand() {
-        let secrets = vec![(SecretName::from_str("a/one").unwrap(), "valueone".to_string())];
+        let secrets = vec![(
+            SecretName::from_str("a/one").unwrap(),
+            "valueone".to_string(),
+        )];
         let store = super::scoped_store(&secrets);
         assert_eq!(
-            store.get(&SecretName::from_str("a/one").unwrap()).unwrap().as_deref(),
+            store
+                .get(&SecretName::from_str("a/one").unwrap())
+                .unwrap()
+                .as_deref(),
             Some("valueone")
         );
     }
@@ -314,7 +343,8 @@ mod tests {
 
     fn store_one() -> MemoryStore {
         let mut s = MemoryStore::new();
-        s.set(&SecretName::from_str("demo/token").unwrap(), "s3cretVALUE").unwrap();
+        s.set(&SecretName::from_str("demo/token").unwrap(), "s3cretVALUE")
+            .unwrap();
         s
     }
 
@@ -326,14 +356,19 @@ mod tests {
             "tool_name": "Bash",
             "tool_response": {"stdout": "KEY=s3cretVALUE", "stderr": ""}
         });
-        let out: Value = serde_json::from_str(&super::post_tool_use(&v, &store_one(), &audit)).unwrap();
-        assert_eq!(out["hookSpecificOutput"]["updatedToolOutput"]["stdout"], "KEY={{demo/token}}");
+        let out: Value =
+            serde_json::from_str(&super::post_tool_use(&v, &store_one(), &audit)).unwrap();
+        assert_eq!(
+            out["hookSpecificOutput"]["updatedToolOutput"]["stdout"],
+            "KEY={{demo/token}}"
+        );
     }
 
     #[test]
     fn post_non_bash_is_passthrough() {
         let (_d, audit) = audit_tmp();
-        let v = json!({"hook_event_name": "PostToolUse", "tool_name": "Read", "tool_response": "x"});
+        let v =
+            json!({"hook_event_name": "PostToolUse", "tool_name": "Read", "tool_response": "x"});
         assert_eq!(super::post_tool_use(&v, &store_one(), &audit), "{}");
     }
 
@@ -343,18 +378,23 @@ mod tests {
         // FailingStore simulates a locked keychain: list() ok, get() errors.
         struct FailingStore;
         impl SecretStore for FailingStore {
-            fn set(&mut self, _: &SecretName, _: &str) -> Result<(), CoreError> { Ok(()) }
+            fn set(&mut self, _: &SecretName, _: &str) -> Result<(), CoreError> {
+                Ok(())
+            }
             fn get(&self, _: &SecretName) -> Result<Option<String>, CoreError> {
                 Err(CoreError::Keyring("locked".into()))
             }
-            fn delete(&mut self, _: &SecretName) -> Result<(), CoreError> { Ok(()) }
+            fn delete(&mut self, _: &SecretName) -> Result<(), CoreError> {
+                Ok(())
+            }
             fn list(&self) -> Result<Vec<SecretName>, CoreError> {
                 Ok(vec![SecretName::from_str("demo/token").unwrap()])
             }
         }
         let v = json!({"hook_event_name": "PostToolUse", "tool_name": "Bash",
                        "tool_response": {"stdout": "KEY=s3cretVALUE"}});
-        let out: Value = serde_json::from_str(&super::post_tool_use(&v, &FailingStore, &audit)).unwrap();
+        let out: Value =
+            serde_json::from_str(&super::post_tool_use(&v, &FailingStore, &audit)).unwrap();
         assert_eq!(
             out["hookSpecificOutput"]["updatedToolOutput"],
             "trosty: vault locked — output suppressed"
@@ -374,7 +414,8 @@ mod tests {
         let (_d, audit) = audit_tmp();
         let v = json!({"hook_event_name": "PreToolUse", "tool_name": "Bash",
                        "tool_input": {"command": "curl -H \"auth: {{demo/token}}\""}});
-        let out: Value = serde_json::from_str(&super::pre_tool_use(&v, &store_one(), &audit)).unwrap();
+        let out: Value =
+            serde_json::from_str(&super::pre_tool_use(&v, &store_one(), &audit)).unwrap();
         assert_eq!(
             out["hookSpecificOutput"]["updatedInput"]["command"],
             "curl -H \"auth: s3cretVALUE\""
@@ -386,7 +427,8 @@ mod tests {
         let (_d, audit) = audit_tmp();
         let v = json!({"hook_event_name": "PreToolUse", "tool_name": "Bash",
                        "tool_input": {"command": "echo {{demo/missing}}"}});
-        let out: Value = serde_json::from_str(&super::pre_tool_use(&v, &store_one(), &audit)).unwrap();
+        let out: Value =
+            serde_json::from_str(&super::pre_tool_use(&v, &store_one(), &audit)).unwrap();
         assert_eq!(out["hookSpecificOutput"]["permissionDecision"], "deny");
     }
 
@@ -410,7 +452,8 @@ mod tests {
         let (_d, audit) = audit_tmp();
         let v = json!({"hook_event_name": "UserPromptSubmit",
                        "prompt": "use key s3cretVALUE to log in"});
-        let out: Value = serde_json::from_str(&super::user_prompt_submit(&v, &store_one(), &audit)).unwrap();
+        let out: Value =
+            serde_json::from_str(&super::user_prompt_submit(&v, &store_one(), &audit)).unwrap();
         assert_eq!(out["decision"], "block");
         assert!(out["reason"].as_str().unwrap().contains("{{name}}"));
     }
@@ -420,17 +463,22 @@ mod tests {
         let (_d, audit) = audit_tmp();
         struct FailingStore;
         impl SecretStore for FailingStore {
-            fn set(&mut self, _: &SecretName, _: &str) -> Result<(), CoreError> { Ok(()) }
+            fn set(&mut self, _: &SecretName, _: &str) -> Result<(), CoreError> {
+                Ok(())
+            }
             fn get(&self, _: &SecretName) -> Result<Option<String>, CoreError> {
                 Err(CoreError::Keyring("locked".into()))
             }
-            fn delete(&mut self, _: &SecretName) -> Result<(), CoreError> { Ok(()) }
+            fn delete(&mut self, _: &SecretName) -> Result<(), CoreError> {
+                Ok(())
+            }
             fn list(&self) -> Result<Vec<SecretName>, CoreError> {
                 Ok(vec![SecretName::from_str("demo/token").unwrap()])
             }
         }
         let v = json!({"hook_event_name": "UserPromptSubmit", "prompt": "hello"});
-        let out: Value = serde_json::from_str(&super::user_prompt_submit(&v, &FailingStore, &audit)).unwrap();
+        let out: Value =
+            serde_json::from_str(&super::user_prompt_submit(&v, &FailingStore, &audit)).unwrap();
         assert_eq!(out["decision"], "block");
     }
 
@@ -439,13 +487,31 @@ mod tests {
         let (_d, audit) = audit_tmp();
         let v = r#"{"hook_event_name":"PostToolUse","tool_name":"Bash","tool_response":{"stdout":"s3cretVALUE"}}"#;
         let out: Value = serde_json::from_str(&super::dispatch(v, &store_one(), &audit)).unwrap();
-        assert_eq!(out["hookSpecificOutput"]["updatedToolOutput"]["stdout"], "{{demo/token}}");
+        assert_eq!(
+            out["hookSpecificOutput"]["updatedToolOutput"]["stdout"],
+            "{{demo/token}}"
+        );
     }
 
     #[test]
     fn dispatch_unknown_event_is_noop() {
         let (_d, audit) = audit_tmp();
-        assert_eq!(super::dispatch(r#"{"hook_event_name":"SessionStart"}"#, &store_one(), &audit), "{}");
+        assert_eq!(
+            super::dispatch(
+                r#"{"hook_event_name":"SessionStart"}"#,
+                &store_one(),
+                &audit
+            ),
+            "{}"
+        );
         assert_eq!(super::dispatch("not json", &store_one(), &audit), "{}");
+    }
+
+    #[test]
+    fn installed_events_lists_trosty_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        std::fs::write(&p, r#"{"hooks":{"PostToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/x/trosty hook"}]}]}}"#).unwrap();
+        assert_eq!(super::installed_events(&p), vec!["PostToolUse".to_string()]);
     }
 }

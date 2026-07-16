@@ -41,6 +41,23 @@ and secret count, and updates live — including a visible degradation
 message if a hot-reload of the secret store ever fails — whenever the
 secret source changes on disk.
 
+## Claude Code integration
+
+`trosty hook install` wires trosty into `~/.claude/settings.json` so Claude
+Code never sees real secret values:
+
+- **Bash output is masked** — a command that prints a secret shows `{{name}}`
+  to the model (`PostToolUse`).
+- **`{{name}}` in a Bash command is expanded** to the real value at run time,
+  so the model writes placeholders, never values (`PreToolUse`).
+- **A prompt containing a raw secret is blocked** with a nudge to use its
+  `{{name}}` placeholder (`UserPromptSubmit`).
+
+Any failure to read the vault fails closed (command denied / output
+suppressed / prompt blocked). Run `trosty doctor` to confirm the hooks are
+installed. Install a stable binary (`cargo install --path crates/trosty`) so
+the macOS keychain "Always Allow" grant persists across rebuilds.
+
 ## v0.1 scope
 
 - `trosty-core`: vault (keyring), scrubber (value + base64/hex/url-encoded
