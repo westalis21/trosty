@@ -177,16 +177,84 @@ pub fn dispatch(input: &str, store: &dyn SecretStore, audit: &Audit) -> String {
     }
 }
 
-// TODO(Task 8): replace stub — real implementation merges trosty's three
-// hooks into ~/.claude/settings.json (idempotent).
-pub fn install(_p: &std::path::Path) -> anyhow::Result<()> {
-    unimplemented!()
+use std::path::Path;
+
+const EVENTS: [(&str, bool); 3] = [
+    ("PreToolUse", true),        // true = tool-matched on "Bash"
+    ("PostToolUse", true),
+    ("UserPromptSubmit", false), // not tool-scoped
+];
+
+fn read_settings(path: &Path) -> anyhow::Result<Value> {
+    if path.exists() {
+        Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
+    } else {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        Ok(json!({}))
+    }
 }
 
-// TODO(Task 8): replace stub — real implementation removes trosty's hooks
-// from ~/.claude/settings.json.
-pub fn uninstall(_p: &std::path::Path) -> anyhow::Result<()> {
-    unimplemented!()
+fn write_settings(path: &Path, v: &Value) -> anyhow::Result<()> {
+    std::fs::write(path, serde_json::to_string_pretty(v)?)?;
+    Ok(())
+}
+
+fn is_trosty_entry(entry: &Value) -> bool {
+    entry.get("hooks").and_then(Value::as_array).is_some_and(|hs| {
+        hs.iter().any(|h| {
+            h.get("command")
+                .and_then(Value::as_str)
+                .is_some_and(|c| c.contains("trosty") && c.trim_end().ends_with("hook"))
+        })
+    })
+}
+
+/// Write the three trosty hooks into `settings_path`, preserving any existing
+/// hooks and never duplicating our own (idempotent).
+pub fn install(settings_path: &Path) -> anyhow::Result<()> {
+    let exe = std::env::current_exe()?;
+    let command = format!("{} hook", exe.display());
+    let mut settings = read_settings(settings_path)?;
+    if !settings.get("hooks").is_some_and(Value::is_object) {
+        settings["hooks"] = json!({});
+    }
+    for (event, tool_matched) in EVENTS {
+        let arr = settings["hooks"]
+            .as_object_mut()
+            .unwrap()
+            .entry(event.to_string())
+            .or_insert_with(|| json!([]));
+        let list = arr.as_array_mut().expect("event maps to an array");
+        list.retain(|e| !is_trosty_entry(e)); // drop our old entry → idempotent
+        let hook_obj = json!({"type": "command", "command": command});
+        let entry = if tool_matched {
+            json!({"matcher": "Bash", "hooks": [hook_obj]})
+        } else {
+            json!({"hooks": [hook_obj]})
+        };
+        list.push(entry);
+    }
+    write_settings(settings_path, &settings)?;
+    println!("installed trosty hooks → {}", settings_path.display());
+    println!("tip: install a stable binary (`cargo install --path crates/trosty`) so macOS keychain 'Always Allow' sticks across rebuilds");
+    Ok(())
+}
+
+/// Remove only trosty's hook entries, leaving foreign hooks intact.
+pub fn uninstall(settings_path: &Path) -> anyhow::Result<()> {
+    let mut settings = read_settings(settings_path)?;
+    if let Some(hooks) = settings.get_mut("hooks").and_then(Value::as_object_mut) {
+        for (event, _) in EVENTS {
+            if let Some(list) = hooks.get_mut(event).and_then(Value::as_array_mut) {
+                list.retain(|e| !is_trosty_entry(e));
+            }
+        }
+    }
+    write_settings(settings_path, &settings)?;
+    println!("removed trosty hooks from {}", settings_path.display());
+    Ok(())
 }
 
 #[cfg(test)]
